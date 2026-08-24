@@ -134,6 +134,29 @@ func TestLeaderWorkDoesNotStartAfterElectionReturns(t *testing.T) {
 	}
 }
 
+func TestLeaderWorkUsesLeadingContext(t *testing.T) {
+	work := newLeaderWork()
+	outerCtx, cancelOuter := context.WithCancel(context.Background())
+	t.Cleanup(cancelOuter)
+	leadingCtx, stopLeading := context.WithCancel(outerCtx)
+	started := make(chan struct{})
+	callback := work.onStartedLeading(func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return nil
+	}, func() {})
+	go callback(leadingCtx)
+	<-started
+
+	stopLeading()
+	select {
+	case <-work.done:
+	case <-time.After(time.Second):
+		t.Fatal("controller work did not stop with the leadership context")
+	}
+	require.NoError(t, outerCtx.Err(), "the outer election context should remain active")
+}
+
 type fakeResourceLock struct {
 	mu       sync.Mutex
 	identity string

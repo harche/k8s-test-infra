@@ -151,19 +151,15 @@ func runLeaderElection(
 ) error {
 	electionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	workCtx, stopWork := context.WithCancel(electionCtx)
-	defer stopWork()
 	work := newLeaderWork()
-	draining := &drainingLock{Interface: lock, workDone: work.done, stopWork: stopWork}
-	electionConfig := newLeaderElectionConfig(config, draining, func(context.Context) {
-		work.start(workCtx, run, cancel)
-	})
+	draining := &drainingLock{Interface: lock, workDone: work.done, stopWork: cancel}
+	electionConfig := newLeaderElectionConfig(config, draining, work.onStartedLeading(run, cancel))
 	elector, err := leaderelection.NewLeaderElector(electionConfig)
 	if err != nil {
 		return fmt.Errorf("configure leader election: %w", err)
 	}
 	elector.Run(electionCtx)
-	stopWork()
+	cancel()
 	if !work.finishElection() {
 		return nil
 	}
@@ -181,6 +177,15 @@ type leaderWork struct {
 
 func newLeaderWork() *leaderWork {
 	return &leaderWork{done: make(chan struct{})}
+}
+
+func (w *leaderWork) onStartedLeading(
+	run func(context.Context) error,
+	stopElection context.CancelFunc,
+) func(context.Context) {
+	return func(ctx context.Context) {
+		w.start(ctx, run, stopElection)
+	}
 }
 
 func (w *leaderWork) start(ctx context.Context, run func(context.Context) error, stopElection context.CancelFunc) {
