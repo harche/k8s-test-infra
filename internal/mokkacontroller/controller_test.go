@@ -90,6 +90,24 @@ func TestControllerOwnedFreeRackAddContinuesPendingAllocation(t *testing.T) {
 		"observing the recreated free slot must reconsider a replacement left pending against stale cache state")
 }
 
+func TestRackOwnerRoutingUsesControllerReferenceWhenInventoryRefDrifts(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
+	rack := testRack(testNode())
+	rack.Spec.InventoryRef = mokkav1alpha1.SGPURackInventoryReference{Name: "foreign", UID: "foreign-uid"}
+
+	router.rackAdd(rack)
+
+	require.Equal(t, []allocate.GroupKey{testGroupKey()}, drainQueue(queues.groups))
+	require.Empty(t, drainQueue(queues.inventories))
+	require.Contains(t, drainQueue(queues.status), statusKey{
+		kind: statusInventory, name: "inventory", uid: "inventory-uid",
+	})
+}
+
 func TestNoOpUpdatesAreSuppressed(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
@@ -194,7 +212,7 @@ func TestDeleteTombstonesRouteExactCleanupBeforeGroup(t *testing.T) {
 	require.Empty(t, drainQueue(queues.groups))
 }
 
-func TestForeignRackDeleteRoutesDesiredNameClaimant(t *testing.T) {
+func TestForeignRackDeleteRoutesRegisteredCollisionWaiter(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
 	queues := newQueues(0)
@@ -210,19 +228,30 @@ func TestForeignRackDeleteRoutesDesiredNameClaimant(t *testing.T) {
 		Name: materialize.RackName(inventory.Name, inventory.UID, "group", 0),
 		UID:  "foreign-rack-uid",
 	}}
+	router.waiters.replaceInventory(inventory, []controllerack.OwnershipConflict{{
+		RackName: blocker.Name, RackGroup: "group", OwnerUID: blocker.UID,
+	}})
 	require.NoError(t, racks.Add(blocker))
 	router.rackAdd(blocker)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
+	deleting := blocker.DeepCopy()
+	deleting.ResourceVersion = "2"
+	deletionTimestamp := metav1.Now()
+	deleting.DeletionTimestamp = &deletionTimestamp
+	router.rackUpdate(blocker, deleting)
+	require.Equal(t, []string{inventory.Name}, drainQueue(queues.inventories),
+		"observing deletion start must wake the blocked claimant")
+	drainQueue(queues.status)
 	require.NoError(t, racks.Delete(blocker))
 
-	router.rackDelete(cache.DeletedFinalStateUnknown{Key: blocker.Name, Obj: blocker})
+	router.rackDelete(cache.DeletedFinalStateUnknown{Key: blocker.Name, Obj: deleting})
 
 	require.Equal(t, []string{inventory.Name}, drainQueue(queues.inventories))
 	require.Equal(t, []statusKey{{kind: statusInventory, name: inventory.Name, uid: inventory.UID}}, drainQueue(queues.status))
 }
 
-func TestRackOwnershipTransitionRoutesDesiredNameClaimant(t *testing.T) {
+func TestRackOwnershipTransitionRoutesRegisteredCollisionWaiter(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
 	queues := newQueues(0)
@@ -238,6 +267,9 @@ func TestRackOwnershipTransitionRoutesDesiredNameClaimant(t *testing.T) {
 		Name: materialize.RackName(inventory.Name, inventory.UID, "group", 0),
 		UID:  "foreign-rack-uid",
 	}}
+	router.waiters.replaceInventory(inventory, []controllerack.OwnershipConflict{{
+		RackName: blocker.Name, RackGroup: "group", OwnerUID: blocker.UID,
+	}})
 	transitioned := blocker.DeepCopy()
 	transitioned.ResourceVersion = "2"
 	transitioned.Spec.InventoryRef = mokkav1alpha1.SGPURackInventoryReference{Name: inventory.Name, UID: inventory.UID}
@@ -324,6 +356,9 @@ func TestStaleRackDeleteDoesNotRouteClaimantPastSameNameReplacement(t *testing.T
 	name := materialize.RackName(inventory.Name, inventory.UID, "group", 0)
 	stale := &mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "stale-rack-uid"}}
 	replacement := &mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "replacement-rack-uid"}}
+	router.waiters.replaceInventory(inventory, []controllerack.OwnershipConflict{{
+		RackName: name, RackGroup: "group", OwnerUID: stale.UID,
+	}})
 	require.NoError(t, racks.Add(replacement))
 
 	router.rackDelete(cache.DeletedFinalStateUnknown{Key: name, Obj: stale})
@@ -332,51 +367,74 @@ func TestStaleRackDeleteDoesNotRouteClaimantPastSameNameReplacement(t *testing.T
 	require.Empty(t, drainQueue(queues.groups))
 }
 
-func TestDesiredRackClaimantTracksInventoryReplacementAndShrink(t *testing.T) {
+func TestInventoryEventRoutingDoesNotExpandDesiredRackNames(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
+	inventory := testInventory()
+	inventory.Spec.RackGroups = make([]mokkav1alpha1.RackGroup, 64)
+	for i := range inventory.Spec.RackGroups {
+		inventory.Spec.RackGroups[i] = mokkav1alpha1.RackGroup{
+			ID: fmt.Sprintf("group-%d", i), Count: 100_000,
+			ProfileRef: mokkav1alpha1.ProfileReference{Name: "profile"},
+		}
+	}
+	require.NoError(t, inventories.Add(inventory))
+
+	router.inventoryAdd(inventory)
+
+	require.Zero(t, router.waiters.size(), "informer callbacks only retain actual reconciliation conflicts")
+	require.Equal(t, []string{inventory.Name}, drainQueue(queues.inventories),
+		"aggregate-invalid input must reach normal reconciliation")
+	require.Equal(t, []statusKey{{kind: statusInventory, name: inventory.Name, uid: inventory.UID}},
+		drainQueue(queues.status))
+}
+
+func TestRackConflictWaitersTrackInventoryReplacement(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
 	queues := newQueues(0)
 	t.Cleanup(queues.shutdown)
 	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
 	oldInventory := testInventory()
-	oldInventory.Spec.RackGroups[0].Count = 2
 	require.NoError(t, inventories.Add(oldInventory))
 	router.inventoryAdd(oldInventory)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
+	oldName := materialize.RackName(oldInventory.Name, oldInventory.UID, "group", 0)
+	router.waiters.replaceInventory(oldInventory, []controllerack.OwnershipConflict{{
+		RackName: oldName, RackGroup: "group", OwnerUID: "old-blocker",
+	}})
+	require.Equal(t, 1, router.waiters.size())
 
 	recreated := oldInventory.DeepCopy()
 	recreated.UID = "recreated-inventory-uid"
 	recreated.ResourceVersion = "2"
-	recreated.Spec.RackGroups[0].Count = 1
 	recreated.Spec.RackGroups[0].ProfileRef.Name = "replacement-profile"
-	router.inventoryDelete(oldInventory)
+	require.NoError(t, inventories.Update(recreated))
+	router.inventoryUpdate(oldInventory, recreated)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
-	require.Zero(t, router.claims.size())
-	require.NoError(t, inventories.Delete(oldInventory))
-	require.NoError(t, inventories.Add(recreated))
-	router.inventoryAdd(recreated)
-	drainQueue(queues.inventories)
-	drainQueue(queues.status)
+	require.Zero(t, router.waiters.size(), "UID and spec replacement clears stale conflicts")
+
+	currentName := materialize.RackName(recreated.Name, recreated.UID, "group", 0)
+	router.waiters.replaceInventory(recreated, []controllerack.OwnershipConflict{{
+		RackName: currentName, RackGroup: "group", OwnerUID: "current-blocker",
+	}})
 	router.inventoryDelete(cache.DeletedFinalStateUnknown{Key: oldInventory.Name, Obj: oldInventory})
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
+	require.Equal(t, 1, router.waiters.size(), "a stale delete must not clear the replacement")
 
-	oldName := materialize.RackName(oldInventory.Name, oldInventory.UID, "group", 0)
-	removedName := materialize.RackName(oldInventory.Name, oldInventory.UID, "group", 1)
-	currentName := materialize.RackName(recreated.Name, recreated.UID, "group", 0)
-	for _, staleName := range []string{oldName, removedName} {
-		router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: staleName, UID: "stale-rack-uid"}})
-		require.Empty(t, drainQueue(queues.inventories))
-	}
-
-	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: currentName, UID: "foreign-rack-uid"}})
+	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: oldName, UID: "old-blocker"}})
+	require.Empty(t, drainQueue(queues.inventories))
+	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: currentName, UID: "current-blocker"}})
 	require.Equal(t, []string{recreated.Name}, drainQueue(queues.inventories))
-	require.Equal(t, []statusKey{{kind: statusInventory, name: recreated.Name, uid: recreated.UID}}, drainQueue(queues.status))
 }
 
-func TestDesiredRackClaimIndexRetainsOnlyCurrentInformerTopology(t *testing.T) {
+func TestRackConflictWaiterIndexRetainsOnlyCurrentReconciledConflicts(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
 	queues := newQueues(0)
@@ -387,7 +445,6 @@ func TestDesiredRackClaimIndexRetainsOnlyCurrentInformerTopology(t *testing.T) {
 	router.inventoryAdd(current)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
-	require.Equal(t, 1, router.claims.size())
 
 	for revision := 2; revision <= 2_000; revision++ {
 		previous := current
@@ -398,66 +455,132 @@ func TestDesiredRackClaimIndexRetainsOnlyCurrentInformerTopology(t *testing.T) {
 		current.Spec.RackGroups[0].ProfileRef.Name = fmt.Sprintf("profile-%d", revision)
 		require.NoError(t, inventories.Update(current))
 		router.inventoryUpdate(previous, current)
+		name := materialize.RackName(current.Name, current.UID, "group", 0)
+		updateRackConflictWaiters(router.waiters, current, current.DeepCopy(), nil, controllerack.Result{
+			OwnershipConflicts: []controllerack.OwnershipConflict{{
+				RackName: name, RackGroup: "group", OwnerUID: "blocker",
+			}},
+		})
 		router.inventoryDelete(cache.DeletedFinalStateUnknown{Key: previous.Name, Obj: previous})
 		drainQueue(queues.inventories)
 		drainQueue(queues.status)
-		require.Equal(t, int(current.Spec.RackGroups[0].Count), router.claims.size())
+		require.Equal(t, []allocate.GroupKey{groupKey(current, "group")}, router.waiters.waiters(name))
+		require.Equal(t, 1, router.waiters.size())
 	}
 
 	router.inventoryDelete(current)
-	require.Zero(t, router.claims.size())
+	require.Zero(t, router.waiters.size())
 }
 
-func TestDesiredRackClaimsTrackShrinkGroupRenameAndProfileRevision(t *testing.T) {
+func TestRackConflictWaitersRouteEveryActualNameCollision(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
+	first := testInventory()
+	first.Name, first.UID = "first", "first-uid"
+	second := testInventory()
+	second.Name, second.UID = "second", "second-uid"
+	conflict := controllerack.OwnershipConflict{RackName: "shared-rack-name", RackGroup: "group", OwnerUID: "blocker"}
+	updateRackConflictWaiters(router.waiters, first, first.DeepCopy(), nil, controllerack.Result{
+		OwnershipConflicts: []controllerack.OwnershipConflict{conflict},
+	})
+	updateRackConflictWaiters(router.waiters, second, second.DeepCopy(), nil, controllerack.Result{
+		OwnershipConflicts: []controllerack.OwnershipConflict{conflict},
+	})
+
+	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{
+		Name: conflict.RackName, UID: conflict.OwnerUID,
+	}})
+
+	require.Equal(t, []string{first.Name, second.Name}, drainQueue(queues.inventories))
+	require.ElementsMatch(t, []statusKey{
+		{kind: statusInventory, name: first.Name, uid: first.UID},
+		{kind: statusInventory, name: second.Name, uid: second.UID},
+	}, drainQueue(queues.status))
+}
+
+func TestRackConflictWaitersClearAfterResolutionSpecChangeAndDeletion(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
 	queues := newQueues(0)
 	t.Cleanup(queues.shutdown)
 	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
 	current := testInventory()
-	current.Spec.RackGroups[0].Count = 2
 	require.NoError(t, inventories.Add(current))
 	router.inventoryAdd(current)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
-	require.Equal(t, 2, router.claims.size())
+	name := materialize.RackName(current.Name, current.UID, "group", 0)
+	conflict := controllerack.OwnershipConflict{RackName: name, RackGroup: "group", OwnerUID: "blocker"}
+	router.waiters.replaceInventory(current, []controllerack.OwnershipConflict{conflict})
+	require.Equal(t, 1, router.waiters.size())
 
-	shrunk := current.DeepCopy()
-	shrunk.ResourceVersion = "2"
-	shrunk.Spec.RackGroups[0].Count = 1
-	shrunk.Spec.RackGroups[0].ProfileRef.Name = "profile-v2"
-	require.NoError(t, inventories.Update(shrunk))
-	router.inventoryUpdate(current, shrunk)
+	profile := &mokkav1alpha1.SGPURackProfile{ObjectMeta: metav1.ObjectMeta{Name: "profile", Generation: 1}}
+	revisedProfile := profile.DeepCopy()
+	revisedProfile.Generation = 2
+	router.profileUpdate(profile, revisedProfile)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
-	require.Equal(t, 1, router.claims.size())
-	removed := materialize.RackName(current.Name, current.UID, "group", 1)
-	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: removed, UID: "removed-rack-uid"}})
+	require.Equal(t, 1, router.waiters.size(), "profile events retain the waiter until reconciliation resolves it")
+
+	key := testGroupKey()
+	updateRackConflictWaiters(router.waiters, current, current.DeepCopy(), &key, controllerack.Result{})
+	require.Zero(t, router.waiters.size(), "a conflict-free group result clears its waiter")
+	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "blocker"}})
 	require.Empty(t, drainQueue(queues.inventories))
 
-	renamed := shrunk.DeepCopy()
-	renamed.ResourceVersion = "3"
+	router.waiters.replaceInventory(current, []controllerack.OwnershipConflict{conflict})
+	renamed := current.DeepCopy()
+	renamed.ResourceVersion = "2"
 	renamed.Spec.RackGroups[0].ID = "renamed"
 	require.NoError(t, inventories.Update(renamed))
-	router.inventoryUpdate(shrunk, renamed)
+	router.inventoryUpdate(current, renamed)
 	drainQueue(queues.inventories)
 	drainQueue(queues.status)
-	oldName := materialize.RackName(shrunk.Name, shrunk.UID, "group", 0)
+	require.Zero(t, router.waiters.size(), "spec changes clear pre-change conflicts")
+	updateRackConflictWaiters(router.waiters, renamed, current, nil, controllerack.Result{
+		OwnershipConflicts: []controllerack.OwnershipConflict{conflict},
+	})
+	require.Zero(t, router.waiters.size(), "a pre-change reconciliation result must not restore a stale waiter")
+
 	newName := materialize.RackName(renamed.Name, renamed.UID, "renamed", 0)
-	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: oldName, UID: "old-rack-uid"}})
-	require.Empty(t, drainQueue(queues.inventories))
-
-	profile := &mokkav1alpha1.SGPURackProfile{ObjectMeta: metav1.ObjectMeta{Name: "profile-v2", UID: "profile-uid", Generation: 1}}
-	revised := profile.DeepCopy()
-	revised.Generation = 2
-	revised.Spec.Rack.NodesPerRack = 2
-	router.profileUpdate(profile, revised)
-	require.Equal(t, []string{renamed.Name}, drainQueue(queues.inventories))
+	router.waiters.replaceInventory(renamed, []controllerack.OwnershipConflict{{
+		RackName: newName, RackGroup: "renamed", OwnerUID: "new-blocker",
+	}})
+	router.inventoryDelete(renamed)
+	drainQueue(queues.inventories)
 	drainQueue(queues.status)
-	require.Equal(t, 1, router.claims.size())
+	require.Zero(t, router.waiters.size(), "inventory deletion clears every group waiter")
+}
 
-	router.rackDelete(&mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{Name: newName, UID: "foreign-rack-uid"}})
-	require.Equal(t, []string{renamed.Name}, drainQueue(queues.inventories))
+func TestRackConflictWaitersRebuildFromInitialInventoryReconciliation(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
+	inventory := testInventory()
+	require.NoError(t, inventories.Add(inventory))
+	blocker := &mokkav1alpha1.SGPURack{ObjectMeta: metav1.ObjectMeta{
+		Name: materialize.RackName(inventory.Name, inventory.UID, "group", 0), UID: "blocker",
+	}}
+
+	router.inventoryAdd(inventory)
+	require.Zero(t, router.waiters.size(), "derived state starts empty after restart")
+	require.Equal(t, []string{inventory.Name}, drainQueue(queues.inventories),
+		"the initial informer add schedules conflict discovery")
+	drainQueue(queues.status)
+
+	updateRackConflictWaiters(router.waiters, inventory, inventory.DeepCopy(), nil, controllerack.Result{
+		OwnershipConflicts: []controllerack.OwnershipConflict{{
+			RackName: blocker.Name, RackGroup: "group", OwnerUID: blocker.UID,
+		}},
+	})
+	router.rackDelete(blocker)
+	require.Equal(t, []string{inventory.Name}, drainQueue(queues.inventories),
+		"the reconciliation result restores blocker-driven routing")
 }
 
 func TestProcessNextRateLimitsErrorsAndForgetsSuccess(t *testing.T) {

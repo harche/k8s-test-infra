@@ -14,6 +14,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -236,6 +237,7 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 		queues:  newQueuesWithStatusIntervals(options.StatusDebounce, options.statusProgressInterval()),
 	}
 	results := newResultStore()
+	rackWaiters := newRackConflictWaiters()
 	var inventoryLocks sync.Map
 	withInventoryLock := func(name string, reconcile func() error) error {
 		value, _ := inventoryLocks.LoadOrStore(name, &sync.Mutex{})
@@ -244,9 +246,15 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 		defer lock.Unlock()
 		return reconcile()
 	}
-	finishRackReconcile := func(name string, group *allocate.GroupKey, result controllerack.Result) error {
+	finishRackReconcile := func(
+		name string,
+		group *allocate.GroupKey,
+		observed *mokkav1alpha1.SGPUInventory,
+		result controllerack.Result,
+	) error {
 		inventory, getErr := snapshot.Inventory(name)
 		if getErr == nil {
+			updateRackConflictWaiters(rackWaiters, inventory, observed, group, result)
 			if group == nil {
 				results.put(inventory.Name, inventory.UID, result)
 			} else {
@@ -263,17 +271,18 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 	}
 	controller.reconcileInventory = func(ctx context.Context, name string) error {
 		return withInventoryLock(name, func() error {
+			observed, _ := snapshot.Inventory(name)
 			result, err := rackReconciler.Reconcile(ctx, name)
 			if err != nil {
 				var ownershipErr *controllerack.OwnershipConflictError
 				if errors.As(err, &ownershipErr) {
-					if statusErr := finishRackReconcile(name, nil, result); statusErr != nil {
+					if statusErr := finishRackReconcile(name, nil, observed, result); statusErr != nil {
 						return errors.Join(err, statusErr)
 					}
 				}
 				return err
 			}
-			return finishRackReconcile(name, nil, result)
+			return finishRackReconcile(name, nil, observed, result)
 		})
 	}
 	controller.reconcileGroup = func(ctx context.Context, key allocate.GroupKey) error {
@@ -285,17 +294,18 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 			if err != nil {
 				return err
 			}
+			observed := inventory.DeepCopy()
 			result, err := rackReconciler.ReconcileGroup(ctx, key)
 			if err != nil {
 				var ownershipErr *controllerack.OwnershipConflictError
 				if errors.As(err, &ownershipErr) {
-					if statusErr := finishRackReconcile(key.InventoryName, &key, result); statusErr != nil {
+					if statusErr := finishRackReconcile(key.InventoryName, &key, observed, result); statusErr != nil {
 						return errors.Join(err, statusErr)
 					}
 				}
 				return err
 			}
-			return finishRackReconcile(key.InventoryName, &key, result)
+			return finishRackReconcile(key.InventoryName, &key, observed, result)
 		})
 	}
 	controller.reconcileProjection = func(ctx context.Context, key projectionKey) error {
@@ -374,6 +384,7 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 		inventoryInformer.GetIndexer(), rackInformer.GetIndexer(), newPlacementRegistry(), controller.queues,
 		allocation.Invalidate,
 	)
+	router.waiters = rackWaiters
 	router.observeRackStatus = statusReconciler.ObserveRackStatus
 	router.forgetRackStatus = statusReconciler.ForgetRackStatus
 	if err := addHandler(profileInformer, cache.ResourceEventHandlerFuncs{
@@ -438,6 +449,26 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 func metadataConflict(err error) bool {
 	var conflict *controllerprojection.MetadataConflictError
 	return errors.As(err, &conflict)
+}
+
+func updateRackConflictWaiters(
+	waiters *rackConflictWaiters,
+	current, observed *mokkav1alpha1.SGPUInventory,
+	group *allocate.GroupKey,
+	result controllerack.Result,
+) {
+	// A result computed from an obsolete Inventory must not restore waiters
+	// that its update event already discarded.
+	if waiters == nil || current == nil || observed == nil || current.UID != observed.UID ||
+		!equality.Semantic.DeepEqual(current.Spec, observed.Spec) ||
+		!equality.Semantic.DeepEqual(current.DeletionTimestamp, observed.DeletionTimestamp) {
+		return
+	}
+	if group == nil {
+		waiters.replaceInventory(current, result.OwnershipConflicts)
+		return
+	}
+	waiters.replaceGroup(*group, result.OwnershipConflicts)
 }
 
 func addHandler(informer cache.SharedIndexInformer, handler cache.ResourceEventHandler) error {

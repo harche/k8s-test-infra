@@ -25,6 +25,20 @@ type DeclaredCapacity struct {
 	GPUs  int64
 }
 
+func validateInventoryRackCapacity(inventory *mokkav1alpha1.SGPUInventory) error {
+	// Reject aggregate-invalid declarations before profile resolution or any
+	// work proportional to the declared rack count.
+	total := DeclaredCapacity{}
+	for _, group := range inventory.Spec.RackGroups {
+		var err error
+		total, err = AddCapacity(total, DeclaredCapacity{Racks: int64(group.Count)})
+		if err != nil {
+			return err
+		}
+	}
+	return ValidateSupportedCapacity(total)
+}
+
 // CapacityForGroup computes one group's declared capacity with checked intermediates.
 func CapacityForGroup(group mokkav1alpha1.RackGroup, profile *mokkav1alpha1.SGPURackProfile) (DeclaredCapacity, error) {
 	if profile == nil {

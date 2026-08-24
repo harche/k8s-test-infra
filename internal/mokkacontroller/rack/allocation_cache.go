@@ -153,7 +153,8 @@ func allocationGroups(
 	resolver := &Reconciler{cache: cache}
 	for _, inventory := range inventories {
 		inventoriesByUID[inventory.UID] = inventory
-		if inventory.DeletionTimestamp != nil || validateInventory(inventory) != nil {
+		if inventory.DeletionTimestamp != nil || validateInventory(inventory) != nil ||
+			validateInventoryRackCapacity(inventory) != nil {
 			continue
 		}
 		resolved, _, resolveErr := resolver.resolveGroups(inventory)

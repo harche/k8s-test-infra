@@ -247,6 +247,12 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 		result.ValidationError = err.Error()
 		return result, nil
 	}
+	if err := validateInventoryRackCapacity(inventory); err != nil {
+		result.Accepted = false
+		result.ValidationReason = ReasonCapacityExceeded
+		result.ValidationError = err.Error()
+		return result, nil
+	}
 
 	resolved, issues, err := r.resolveGroups(inventory)
 	if err != nil {

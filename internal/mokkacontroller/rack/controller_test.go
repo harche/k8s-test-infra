@@ -168,6 +168,15 @@ func TestSupportedInventoryCapacityBoundariesAndOverflow(t *testing.T) {
 		DeclaredCapacity{GPUs: 1},
 	)
 	require.EqualError(t, err, "aggregate GPU capacity overflows int64")
+
+	inventory := testInventory("inventory", "inventory-uid", "profile", 50_000)
+	second := inventory.Spec.RackGroups[0]
+	second.ID = "second"
+	inventory.Spec.RackGroups = append(inventory.Spec.RackGroups, second)
+	require.NoError(t, validateInventoryRackCapacity(inventory), "the aggregate rack boundary remains valid")
+	inventory.Spec.RackGroups[1].Count++
+	require.EqualError(t, validateInventoryRackCapacity(inventory),
+		"desired racks 100001 exceed supported maximum 100000")
 }
 
 func TestReconcileRejectsAggregateCapacityBeforeAllocationOrWrites(t *testing.T) {
@@ -198,10 +207,47 @@ func TestReconcileRejectsAggregateCapacityBeforeAllocationOrWrites(t *testing.T)
 	require.NoError(t, err)
 	require.False(t, result.Accepted)
 	require.Equal(t, ReasonCapacityExceeded, result.ValidationReason)
-	require.Equal(t, "desired Nodes 100001 exceed supported maximum 100000", result.ValidationError)
+	require.Equal(t, "desired racks 100001 exceed supported maximum 100000", result.ValidationError)
 	require.Zero(t, allocationCalls, "rejected capacity must not invoke allocation")
 	require.Zero(t, result.Work)
 	require.Empty(t, h.mokka.Actions(), "rejected capacity must not issue API writes")
+}
+
+func TestReconcileRejectsAdmittedMaximumPerGroupBeforeProfileResolution(t *testing.T) {
+	ctx := context.Background()
+	inventory := testInventory("inventory", "inventory-uid", "missing-profile", 100_000)
+	inventory.Spec.RackGroups = make([]mokkav1alpha1.RackGroup, 64)
+	for i := range inventory.Spec.RackGroups {
+		inventory.Spec.RackGroups[i] = mokkav1alpha1.RackGroup{
+			ID: fmt.Sprintf("group-%d", i), Count: 100_000,
+			ProfileRef: mokkav1alpha1.ProfileReference{Name: "missing-profile"},
+		}
+	}
+	h := newHarness(t, []runtime.Object{inventory}, nil)
+	allocation := NewAllocationCache(h.cache)
+	allocationCalls := 0
+	allocation.allocate = func(allocate.Input) (allocate.Plan, error) {
+		allocationCalls++
+		return allocate.Plan{}, nil
+	}
+	reconciler := NewReconcilerWithAllocationCache(
+		h.cache,
+		h.mokka.MokkaV1alpha1().SGPUInventories(),
+		h.mokka.MokkaV1alpha1().SGPURacks(),
+		CleanupGateFunc(func(CleanupNeeded) bool { return false }),
+		allocation,
+	)
+	h.mokka.Fake.ClearActions()
+
+	result, err := reconciler.Reconcile(ctx, inventory.Name)
+
+	require.NoError(t, err)
+	require.False(t, result.Accepted)
+	require.Equal(t, ReasonCapacityExceeded, result.ValidationReason)
+	require.Equal(t, "desired racks 6400000 exceed supported maximum 100000", result.ValidationError)
+	require.Zero(t, allocationCalls)
+	require.Zero(t, result.Work)
+	require.Empty(t, h.mokka.Actions())
 }
 
 func TestReconcileGroupIndexesLargeBindingSetOnce(t *testing.T) {
