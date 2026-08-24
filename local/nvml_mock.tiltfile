@@ -200,10 +200,9 @@ def install_fleet(active_consumers, profiles = FLEET_PROFILES, nvmlmock_image=''
     contains the chart name ('nvml-mock'), so 'nvml-mock-a100' / 'nvml-mock-t4'
     produce collision-free DaemonSets, ConfigMaps, RBAC across releases.
 
-    control_plane=True flips controlPlane.enabled on every release. In fleet
-    mode this yields one CP per profile; that's fine for the init slice
-    (health probes only), and future MEPs that give the CP real state will
-    revisit the placement story.
+    control_plane=True enables the cluster-wide control plane on the first
+    profile release only. profiles is ordered, so this gives the singleton a
+    deterministic Helm owner while retaining every per-profile mock release.
     """
     for i in range(len(profiles)):
         _install(
@@ -214,7 +213,7 @@ def install_fleet(active_consumers, profiles = FLEET_PROFILES, nvmlmock_image=''
             # kubernetes.io is escaped to keep the label key in one piece.
             extra_set=['nodeSelector.kubernetes\\.io/hostname=worker-%d' % i],
             nvmlmock_image=nvmlmock_image,
-            control_plane=control_plane,
+            control_plane=control_plane and i == 0,
         )
 
     return ['nvml-mock-' + p for p in profiles]

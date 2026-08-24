@@ -62,7 +62,7 @@ config.define_bool('fgo', args=False,
 config.define_bool('topograph', args=False,
     usage='Also deploy NVIDIA topograph. Implies --compute-domain (topograph reads the static nvidia.com/gpu.clique labels). Still requires the compute-domain Kind cluster: make cluster-create PROFILE=compute-domain.')
 config.define_bool('control-plane', args=False,
-    usage='Also deploy the Mokka Control Plane (MEP-0001) alongside nvml-mock. Off by default. Composes with --multi-gpu-profile (one CP per release), --compute-domain, and --nvmlmock-image.')
+    usage='Also deploy the Mokka Control Plane (MEP-0001) alongside nvml-mock. Off by default. Composes with --multi-gpu-profile (the first profile release owns the single CP), --compute-domain, and --nvmlmock-image.')
 # CI hook: hand Tilt a pre-built image (in CI, loaded from the workflow's image
 # artifact) instead of running docker_build. When set, docker_build is skipped
 # and the nvml-mock chart's image.repository / image.tag are pinned via --set
