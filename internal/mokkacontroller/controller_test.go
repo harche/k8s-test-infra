@@ -226,6 +226,64 @@ func TestDeleteTombstonesRouteExactCleanupBeforeGroup(t *testing.T) {
 	require.Empty(t, drainQueue(queues.groups))
 }
 
+func TestInventoryDeleteRequeuesEverySurvivingInventory(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	registry := newPlacementRegistry()
+	router := newEventRouter(inventories, racks, registry, queues)
+
+	deleted := testInventory()
+	deleted.Name, deleted.UID = "deleted", "deleted-uid"
+	first := testInventory()
+	first.Name, first.UID = "first", "first-uid"
+	second := testInventory()
+	second.Name, second.UID = "second", "second-uid"
+	second.Spec.RackGroups = nil
+	for _, inventory := range []*mokkav1alpha1.SGPUInventory{deleted, first, second} {
+		registry.replace(inventory)
+	}
+
+	router.inventoryDelete(cache.DeletedFinalStateUnknown{Key: deleted.Name, Obj: deleted})
+
+	require.Equal(t, []string{deleted.Name, first.Name, second.Name}, drainQueue(queues.inventories))
+	require.ElementsMatch(t, []statusKey{
+		{kind: statusInventory, name: deleted.Name, uid: deleted.UID},
+		{kind: statusInventory, name: first.Name, uid: first.UID},
+		{kind: statusInventory, name: second.Name, uid: second.UID},
+	}, drainQueue(queues.status))
+	require.Equal(t, []allocate.GroupKey{groupKey(first, "group")}, registry.matching(testNode()))
+}
+
+func TestStaleInventoryDeleteDoesNotRequeueUnrelatedInventories(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	registry := newPlacementRegistry()
+	router := newEventRouter(inventories, racks, registry, queues)
+
+	stale := testInventory()
+	replacement := stale.DeepCopy()
+	replacement.UID = "replacement-uid"
+	replacement.Spec.RackGroups = nil
+	unrelated := testInventory()
+	unrelated.Name, unrelated.UID = "unrelated", "unrelated-uid"
+	registry.replace(replacement)
+	registry.replace(unrelated)
+
+	router.inventoryDelete(cache.DeletedFinalStateUnknown{Key: stale.Name, Obj: stale})
+
+	require.Equal(t, []string{stale.Name}, drainQueue(queues.inventories))
+	require.Equal(t, []statusKey{{kind: statusInventory, name: stale.Name, uid: stale.UID}}, drainQueue(queues.status))
+	survivors, removed := registry.remove(replacement)
+	require.True(t, removed, "a stale delete must retain even a zero-group replacement registry entry")
+	require.Equal(t, []placementInventoryKey{{name: unrelated.Name, uid: unrelated.UID}}, survivors)
+	require.Equal(t, []allocate.GroupKey{groupKey(unrelated, "group")}, registry.matching(testNode()),
+		"removing the replacement must retain unrelated placement")
+}
+
 func TestForeignRackDeleteRoutesRegisteredCollisionWaiter(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())

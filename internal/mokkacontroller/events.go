@@ -163,11 +163,21 @@ func (r *rackConflictWaiters) size() int {
 
 type placementRegistry struct {
 	mu          sync.RWMutex
-	byInventory map[string]map[allocate.GroupKey]labels.Selector
+	byInventory map[string]placementInventory
+}
+
+type placementInventory struct {
+	uid    types.UID
+	groups map[allocate.GroupKey]labels.Selector
+}
+
+type placementInventoryKey struct {
+	name string
+	uid  types.UID
 }
 
 func newPlacementRegistry() *placementRegistry {
-	return &placementRegistry{byInventory: make(map[string]map[allocate.GroupKey]labels.Selector)}
+	return &placementRegistry{byInventory: make(map[string]placementInventory)}
 }
 
 func (r *placementRegistry) replace(inventory *mokkav1alpha1.SGPUInventory) {
@@ -188,25 +198,32 @@ func (r *placementRegistry) replace(inventory *mokkav1alpha1.SGPUInventory) {
 		groups[key] = selector
 	}
 	r.mu.Lock()
-	r.byInventory[inventory.Name] = groups
+	r.byInventory[inventory.Name] = placementInventory{uid: inventory.UID, groups: groups}
 	r.mu.Unlock()
 }
 
-func (r *placementRegistry) remove(inventory *mokkav1alpha1.SGPUInventory) {
+func (r *placementRegistry) remove(inventory *mokkav1alpha1.SGPUInventory) ([]placementInventoryKey, bool) {
 	if inventory == nil {
-		return
+		return nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	old := r.byInventory[inventory.Name]
-	if len(old) > 0 {
-		for key := range old {
-			if key.InventoryUID != inventory.UID {
-				return
-			}
-		}
+	old, exists := r.byInventory[inventory.Name]
+	if !exists || old.uid != inventory.UID {
+		return nil, false
 	}
 	delete(r.byInventory, inventory.Name)
+	survivors := make([]placementInventoryKey, 0, len(r.byInventory))
+	for name, registered := range r.byInventory {
+		survivors = append(survivors, placementInventoryKey{name: name, uid: registered.uid})
+	}
+	slices.SortFunc(survivors, func(a, b placementInventoryKey) int {
+		if order := cmp.Compare(a.name, b.name); order != 0 {
+			return order
+		}
+		return cmp.Compare(string(a.uid), string(b.uid))
+	})
+	return survivors, true
 }
 
 func (r *placementRegistry) matching(node *corev1.Node) []allocate.GroupKey {
@@ -217,8 +234,8 @@ func (r *placementRegistry) matching(node *corev1.Node) []allocate.GroupKey {
 	defer r.mu.RUnlock()
 	matches := make([]allocate.GroupKey, 0, 1)
 	set := labels.Set(node.Labels)
-	for _, groups := range r.byInventory {
-		for key, selector := range groups {
+	for _, inventory := range r.byInventory {
+		for key, selector := range inventory.groups {
 			if selector.Matches(set) {
 				matches = append(matches, key)
 			}
@@ -300,14 +317,24 @@ func (r *eventRouter) inventoryDelete(object any) {
 		return
 	}
 	r.invalidateAllocation()
-	r.registry.remove(inventory)
+	survivors, removed := r.registry.remove(inventory)
 	r.waiters.removeInventory(inventory)
 	r.routeInventory(inventory)
+	if !removed {
+		return
+	}
+	for _, survivor := range survivors {
+		r.routeInventoryKey(survivor)
+	}
 }
 
 func (r *eventRouter) routeInventory(inventory *mokkav1alpha1.SGPUInventory) {
-	r.queues.inventories.Add(inventory.Name)
-	r.queues.addStatus(statusKey{kind: statusInventory, name: inventory.Name, uid: inventory.UID})
+	r.routeInventoryKey(placementInventoryKey{name: inventory.Name, uid: inventory.UID})
+}
+
+func (r *eventRouter) routeInventoryKey(inventory placementInventoryKey) {
+	r.queues.inventories.Add(inventory.name)
+	r.queues.addStatus(statusKey{kind: statusInventory, name: inventory.name, uid: inventory.uid})
 }
 
 func (r *eventRouter) profileAdd(object any) {
