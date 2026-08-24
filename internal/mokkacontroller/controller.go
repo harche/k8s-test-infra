@@ -382,7 +382,8 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 
 	router := newEventRouter(
 		inventoryInformer.GetIndexer(), rackInformer.GetIndexer(), newPlacementRegistry(), controller.queues,
-		allocation.Invalidate,
+		allocation.InvalidateAllocation,
+		allocation.InvalidateCapacity,
 	)
 	router.waiters = rackWaiters
 	router.observeRackStatus = statusReconciler.ObserveRackStatus

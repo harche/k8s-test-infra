@@ -4,19 +4,230 @@
 package rack
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
+	"sync"
+	"sync/atomic"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	mokkav1alpha1 "github.com/NVIDIA/k8s-test-infra/internal/controlplane/api/v1alpha1"
 )
 
 const (
-	// MaxInventoryNodes is the largest topology supported by one Inventory.
+	// MaxInventoryNodes is the largest admitted controller topology.
 	MaxInventoryNodes int64 = 100_000
 	// ReasonCapacityExceeded identifies declarations outside the supported topology envelope.
 	ReasonCapacityExceeded = "CapacityExceeded"
 )
+
+type capacityRevision uint64
+
+type admissionInventory struct {
+	instance inventoryInstance
+	created  metav1.Time
+	capacity DeclaredCapacity
+}
+
+type capacityAdmissionSnapshot struct {
+	revision capacityRevision
+	admitted []admissionInventory
+	err      error
+}
+
+// CapacityAdmission coalesces deterministic admission across concurrent
+// workers. Its published slice contains one entry per positive-capacity
+// admitted Inventory, bounded by the rack limit, and retains no rejected set.
+// Candidates are considered by creation timestamp, name, and UID; each valid
+// materializable Inventory is admitted whole when it fits the remaining limit.
+type CapacityAdmission struct {
+	cache Cache
+
+	revision     atomic.Uint64
+	computations atomic.Uint64
+	mu           sync.Mutex
+	snapshot     *capacityAdmissionSnapshot
+}
+
+// NewCapacityAdmission constructs aggregate admission over informer state.
+func NewCapacityAdmission(cache Cache) *CapacityAdmission {
+	return &CapacityAdmission{cache: cache}
+}
+
+// Invalidate prevents workers using the previous Inventory/Profile snapshot
+// from continuing rack-proportional work.
+func (a *CapacityAdmission) Invalidate() {
+	a.revision.Add(1)
+}
+
+func (a *CapacityAdmission) currentRevision() capacityRevision {
+	return capacityRevision(a.revision.Load())
+}
+
+func (a *CapacityAdmission) current(revision capacityRevision) bool {
+	return revision == a.currentRevision()
+}
+
+func (a *CapacityAdmission) admits(
+	revision capacityRevision,
+	inventory *mokkav1alpha1.SGPUInventory,
+	capacity DeclaredCapacity,
+) (bool, error) {
+	if !a.current(revision) {
+		return false, errAllocationInputChanged
+	}
+	if capacity.Racks == 0 {
+		return true, nil
+	}
+	snapshot := a.snapshotFor(revision)
+	if snapshot.err != nil {
+		return false, snapshot.err
+	}
+	if !a.current(revision) {
+		return false, errAllocationInputChanged
+	}
+	candidate := admissionInventory{
+		instance: inventoryInstance{name: inventory.Name, uid: inventory.UID},
+		created:  inventory.CreationTimestamp,
+		capacity: capacity,
+	}
+	index, found := slices.BinarySearchFunc(snapshot.admitted, candidate, compareAdmissionInventories)
+	if !found {
+		return false, nil
+	}
+	admitted := snapshot.admitted[index]
+	if admitted.capacity != candidate.capacity {
+		return false, errAllocationInputChanged
+	}
+	return true, nil
+}
+
+func (a *CapacityAdmission) snapshotFor(revision capacityRevision) *capacityAdmissionSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.snapshot != nil && a.snapshot.revision == revision {
+		return a.snapshot
+	}
+	if !a.current(revision) {
+		return &capacityAdmissionSnapshot{revision: revision, err: errAllocationInputChanged}
+	}
+	snapshot := a.computeSnapshot(revision)
+	if !a.current(revision) {
+		return &capacityAdmissionSnapshot{revision: revision, err: errAllocationInputChanged}
+	}
+	if snapshot.err == nil {
+		a.computations.Add(1)
+	}
+	a.snapshot = snapshot
+	return snapshot
+}
+
+func (a *CapacityAdmission) computeSnapshot(revision capacityRevision) *capacityAdmissionSnapshot {
+	inventories, err := a.cache.Inventories()
+	if err != nil {
+		return &capacityAdmissionSnapshot{
+			revision: revision,
+			err:      fmt.Errorf("list inventories for capacity admission: %w", err),
+		}
+	}
+	slices.SortFunc(inventories, compareInventoryAdmissionOrder)
+	admitted := make([]admissionInventory, 0, min(len(inventories), int(MaxInventoryNodes)))
+	total := DeclaredCapacity{}
+	for _, inventory := range inventories {
+		capacity, materializes, capacityErr := materializedInventoryCapacity(a.cache, inventory)
+		if capacityErr != nil {
+			return &capacityAdmissionSnapshot{revision: revision, err: capacityErr}
+		}
+		if !materializes {
+			continue
+		}
+		candidate := admissionInventory{
+			instance: inventoryInstance{name: inventory.Name, uid: inventory.UID},
+			created:  inventory.CreationTimestamp,
+			capacity: capacity,
+		}
+		next, addErr := AddCapacity(total, capacity)
+		if addErr != nil || ValidateSupportedCapacity(next) != nil {
+			continue
+		}
+		admitted = append(admitted, candidate)
+		total = next
+	}
+	return &capacityAdmissionSnapshot{revision: revision, admitted: admitted}
+}
+
+func materializedInventoryCapacity(
+	cache Cache,
+	inventory *mokkav1alpha1.SGPUInventory,
+) (DeclaredCapacity, bool, error) {
+	resolved, err := materializedInventoryGroups(cache, inventory)
+	if err != nil {
+		return DeclaredCapacity{}, false, err
+	}
+	total, err := capacityForResolvedGroups(resolved)
+	return total, len(resolved) > 0, err
+}
+
+func materializedInventoryGroups(
+	cache Cache,
+	inventory *mokkav1alpha1.SGPUInventory,
+) ([]resolvedGroup, error) {
+	if inventory == nil || inventory.DeletionTimestamp != nil || validateInventory(inventory) != nil ||
+		validateInventoryRackCapacity(inventory) != nil {
+		return nil, nil
+	}
+	resolved, _, err := (&Reconciler{cache: cache}).resolveGroups(inventory)
+	if err != nil {
+		return nil, err
+	}
+	if validateResolvedCapacity(resolved) != nil {
+		return nil, nil
+	}
+	resolved, _ = validateGroupMaterialization(inventory, resolved)
+	return resolved, nil
+}
+
+func admitInventoryCapacities(candidates []admissionInventory) []admissionInventory {
+	admitted := make([]admissionInventory, 0, min(len(candidates), int(MaxInventoryNodes)))
+	total := DeclaredCapacity{}
+	for _, candidate := range candidates {
+		next, err := AddCapacity(total, candidate.capacity)
+		if err != nil || ValidateSupportedCapacity(next) != nil {
+			continue
+		}
+		admitted = append(admitted, candidate)
+		total = next
+	}
+	return admitted
+}
+
+func compareInventoryAdmissionOrder(a, b *mokkav1alpha1.SGPUInventory) int {
+	return compareAdmissionInventories(
+		admissionInventory{instance: inventoryInstance{name: a.Name, uid: a.UID}, created: a.CreationTimestamp},
+		admissionInventory{instance: inventoryInstance{name: b.Name, uid: b.UID}, created: b.CreationTimestamp},
+	)
+}
+
+func compareAdmissionInventories(a, b admissionInventory) int {
+	if order := a.created.Time.Compare(b.created.Time); order != 0 {
+		return order
+	}
+	if order := cmp.Compare(a.instance.name, b.instance.name); order != 0 {
+		return order
+	}
+	return cmp.Compare(string(a.instance.uid), string(b.instance.uid))
+}
+
+func aggregateCapacityAdmissionError(inventory *mokkav1alpha1.SGPUInventory) string {
+	return fmt.Sprintf(
+		"inventory %q is outside the aggregate limit of %d Nodes or racks; Inventories are admitted whole by oldest-first fit",
+		inventory.Name,
+		MaxInventoryNodes,
+	)
+}
 
 // DeclaredCapacity holds checked capacity values before conversion to API status types.
 type DeclaredCapacity struct {

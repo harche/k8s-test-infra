@@ -230,16 +230,12 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 		return result, nil
 	}
 
-	var ownedRacks []*mokkav1alpha1.SGPURack
-	if requestedGroup == nil || inventory.DeletionTimestamp != nil {
-		ownedRacks, err = r.cache.RacksByInventoryUID(inventory.UID)
-		if err != nil {
-			return result, fmt.Errorf("get racks for inventory %q from cache: %w", key, err)
+	if inventory.DeletionTimestamp != nil {
+		ownedRacks, listErr := r.cache.RacksByInventoryUID(inventory.UID)
+		if listErr != nil {
+			return result, fmt.Errorf("get racks for inventory %q from cache: %w", key, listErr)
 		}
 		ownedRacks = filterOwnedRacks(ownedRacks, inventory)
-	}
-
-	if inventory.DeletionTimestamp != nil {
 		return r.reconcileInventoryDeletion(ctx, inventory, ownedRacks, result)
 	}
 	if err := validateInventory(inventory); err != nil {
@@ -268,9 +264,48 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 	issues = append(issues, materializationIssues...)
 	result.ProfileIssues = issues
 	result.ResolvedRefs = len(issues) == 0
+	materializedCapacity, err := capacityForResolvedGroups(resolved)
+	if err != nil {
+		return result, err
+	}
+	admitted, err := r.allocation.admission.admits(
+		allocationRevision.capacity,
+		inventory,
+		materializedCapacity,
+	)
+	if err != nil {
+		return result, err
+	}
+	if !admitted {
+		result.Accepted = false
+		result.ValidationReason = ReasonCapacityExceeded
+		result.ValidationError = aggregateCapacityAdmissionError(inventory)
+		return result, nil
+	}
+	admissionCurrent := func() error {
+		if !r.allocation.admission.current(allocationRevision.capacity) {
+			return errAllocationInputChanged
+		}
+		return nil
+	}
+	if err := admissionCurrent(); err != nil {
+		return result, err
+	}
+
+	var ownedRacks []*mokkav1alpha1.SGPURack
+	if requestedGroup == nil {
+		ownedRacks, err = r.cache.RacksByInventoryUID(inventory.UID)
+		if err != nil {
+			return result, fmt.Errorf("get racks for inventory %q from cache: %w", key, err)
+		}
+		ownedRacks = filterOwnedRacks(ownedRacks, inventory)
+	}
 	if !slices.Contains(inventory.Finalizers, InventoryFinalizer) {
 		if requestedGroup != nil {
 			return result, nil
+		}
+		if err := admissionCurrent(); err != nil {
+			return result, err
 		}
 		changed, err := r.mutateInventory(ctx, inventory, func(latest *mokkav1alpha1.SGPUInventory) bool {
 			if slices.Contains(latest.Finalizers, InventoryFinalizer) {
@@ -324,6 +359,9 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 	blockedNames := make(map[string]struct{})
 	existingByName := make(map[string]*mokkav1alpha1.SGPURack, len(ownedRacks))
 	for _, existing := range ownedRacks {
+		if err := admissionCurrent(); err != nil {
+			return result, err
+		}
 		existingByName[existing.Name] = existing
 		if existing.DeletionTimestamp == nil {
 			continue
@@ -342,24 +380,26 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 		result.CleanupNeeded = append(result.CleanupNeeded, cleanup...)
 	}
 
-	desiredNames := make(map[string]struct{})
-	if requestedGroup == nil {
-		for _, group := range workGroups {
-			for rackIndex := int32(0); rackIndex < group.group.Count; rackIndex++ {
-				desiredNames[materialize.RackName(inventory.Name, inventory.UID, group.group.ID, rackIndex)] = struct{}{}
-			}
-		}
-	}
-
 	if requestedGroup == nil { //nolint:nestif // Full inventory reconciliation also owns rack retirement.
 		for _, existing := range ownedRacks {
+			if err := admissionCurrent(); err != nil {
+				return result, err
+			}
 			if existing.DeletionTimestamp != nil {
 				continue
 			}
 			if _, keepLastGood := unresolved[existing.Spec.Identity.RackGroup]; keepLastGood {
 				continue
 			}
-			if _, desired := desiredNames[existing.Name]; desired {
+			group, declared := resolvedByID[existing.Spec.Identity.RackGroup]
+			if declared && existing.Spec.Identity.RackIndex >= 0 &&
+				existing.Spec.Identity.RackIndex < group.group.Count &&
+				existing.Name == materialize.RackName(
+					inventory.Name,
+					inventory.UID,
+					group.group.ID,
+					existing.Spec.Identity.RackIndex,
+				) {
 				continue
 			}
 			reason := CleanupGroupRemoved
@@ -389,6 +429,9 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 	result.Work.AllocationsIndexed = allocations.indexed
 	for _, group := range workGroups {
 		reconcileRack := func(rackIndex int32) error {
+			if err := admissionCurrent(); err != nil {
+				return err
+			}
 			result.Work.RacksReconciled++
 			rendered, err := materialize.RenderRack(materialize.RackInput{
 				InventoryName: inventory.Name,
@@ -445,6 +488,9 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 				return nil
 			}
 
+			if err := admissionCurrent(); err != nil {
+				return err
+			}
 			changed, conflict, err := r.createOrUpdateRack(ctx, inventory, existing, rendered.Name, targetSpec)
 			if conflict != nil {
 				result.OwnershipConflicts = append(result.OwnershipConflicts, *conflict)
@@ -523,21 +569,29 @@ func (r *Reconciler) resolveGroups(inventory *mokkav1alpha1.SGPUInventory) ([]re
 }
 
 func validateResolvedCapacity(groups []resolvedGroup) error {
+	total, err := capacityForResolvedGroups(groups)
+	if err != nil {
+		return err
+	}
+	return ValidateSupportedCapacity(total)
+}
+
+func capacityForResolvedGroups(groups []resolvedGroup) (DeclaredCapacity, error) {
 	total := DeclaredCapacity{}
 	for _, group := range groups {
 		capacity, err := CapacityForGroup(group.group, group.profile)
 		if err != nil {
-			return err
+			return DeclaredCapacity{}, err
 		}
 		if err := ValidateSupportedCapacity(capacity); err != nil {
-			return err
+			return DeclaredCapacity{}, err
 		}
 		total, err = AddCapacity(total, capacity)
 		if err != nil {
-			return err
+			return DeclaredCapacity{}, err
 		}
 	}
-	return ValidateSupportedCapacity(total)
+	return total, nil
 }
 
 func validateGroupMaterialization(

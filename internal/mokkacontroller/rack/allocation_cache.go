@@ -23,6 +23,7 @@ var errAllocationInputChanged = errors.New("allocation input changed during reco
 type allocationRevision struct {
 	topology uint64
 	nodes    uint64
+	capacity capacityRevision
 }
 
 type inventoryInstance struct {
@@ -51,6 +52,9 @@ type AllocationCacheStats struct {
 // reachable only while active reconciles consume their group-sized views.
 type AllocationCache struct {
 	cache Cache
+	// admission shares the exact capacity decision used by rack workers with
+	// the global allocator.
+	admission *CapacityAdmission
 
 	topology     atomic.Uint64
 	computations atomic.Uint64
@@ -61,13 +65,28 @@ type AllocationCache struct {
 
 // NewAllocationCache returns a coalescing allocation cache over informer data.
 func NewAllocationCache(cache Cache) *AllocationCache {
-	return &AllocationCache{cache: cache, allocate: allocate.Allocate}
+	return &AllocationCache{
+		cache: cache, admission: NewCapacityAdmission(cache), allocate: allocate.Allocate,
+	}
 }
 
 // Invalidate advances the cheap topology revision after an allocation-relevant
 // Inventory, Profile, or Rack informer event.
 func (c *AllocationCache) Invalidate() {
 	c.topology.Add(1)
+	c.admission.Invalidate()
+}
+
+// InvalidateAllocation advances inputs that do not affect capacity admission,
+// such as Rack bindings.
+func (c *AllocationCache) InvalidateAllocation() {
+	c.topology.Add(1)
+}
+
+// InvalidateCapacity advances Inventory/Profile admission and, through the
+// combined revision, invalidates the allocation snapshot as well.
+func (c *AllocationCache) InvalidateCapacity() {
+	c.admission.Invalidate()
 }
 
 // Stats returns cache counters without retaining a snapshot.
@@ -81,7 +100,11 @@ func (c *AllocationCache) Stats() AllocationCacheStats {
 }
 
 func (c *AllocationCache) revision() allocationRevision {
-	return allocationRevision{topology: c.topology.Load(), nodes: c.cache.AllocationNodeGeneration()}
+	return allocationRevision{
+		topology: c.topology.Load(),
+		nodes:    c.cache.AllocationNodeGeneration(),
+		capacity: c.admission.currentRevision(),
+	}
 }
 
 func (c *AllocationCache) plan(group *allocate.GroupKey, inventory inventoryInstance) (allocate.Plan, error) {
@@ -99,7 +122,7 @@ func (c *AllocationCache) planRevision(
 		return allocate.Plan{}, errAllocationInputChanged
 	}
 	if c.snapshot == nil || c.snapshot.revision != revision {
-		input, err := allocationInput(c.cache)
+		input, err := allocationInputRevision(c.cache, c.admission, revision.capacity)
 		var plan allocate.Plan
 		if err == nil {
 			plan, err = c.allocate(input)
@@ -125,11 +148,20 @@ func (c *AllocationCache) planRevision(
 }
 
 func allocationInput(cache Cache) (allocate.Input, error) {
+	admission := NewCapacityAdmission(cache)
+	return allocationInputRevision(cache, admission, admission.currentRevision())
+}
+
+func allocationInputRevision(
+	cache Cache,
+	admission *CapacityAdmission,
+	revision capacityRevision,
+) (allocate.Input, error) {
 	inventories, err := cache.Inventories()
 	if err != nil {
 		return allocate.Input{}, fmt.Errorf("list inventories from cache: %w", err)
 	}
-	groups, inventoriesByUID, err := allocationGroups(cache, inventories)
+	groups, inventoriesByUID, err := allocationGroups(cache, inventories, admission, revision)
 	if err != nil {
 		return allocate.Input{}, err
 	}
@@ -147,24 +179,34 @@ func allocationInput(cache Cache) (allocate.Input, error) {
 func allocationGroups(
 	cache Cache,
 	inventories []*mokkav1alpha1.SGPUInventory,
+	admission *CapacityAdmission,
+	revision capacityRevision,
 ) ([]allocate.Group, map[types.UID]*mokkav1alpha1.SGPUInventory, error) {
 	groups := make([]allocate.Group, 0)
-	inventoriesByUID := make(map[types.UID]*mokkav1alpha1.SGPUInventory, len(inventories))
-	resolver := &Reconciler{cache: cache}
+	inventoriesByUID := make(
+		map[types.UID]*mokkav1alpha1.SGPUInventory,
+		min(len(inventories), int(MaxInventoryNodes)),
+	)
 	for _, inventory := range inventories {
+		resolved, err := materializedInventoryGroups(cache, inventory)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(resolved) == 0 {
+			continue
+		}
+		capacity, err := capacityForResolvedGroups(resolved)
+		if err != nil {
+			return nil, nil, err
+		}
+		admitted, err := admission.admits(revision, inventory, capacity)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !admitted {
+			continue
+		}
 		inventoriesByUID[inventory.UID] = inventory
-		if inventory.DeletionTimestamp != nil || validateInventory(inventory) != nil ||
-			validateInventoryRackCapacity(inventory) != nil {
-			continue
-		}
-		resolved, _, resolveErr := resolver.resolveGroups(inventory)
-		if resolveErr != nil {
-			return nil, nil, resolveErr
-		}
-		if validateResolvedCapacity(resolved) != nil {
-			continue
-		}
-		resolved, _ = validateGroupMaterialization(inventory, resolved)
 		for _, group := range resolved {
 			var selector *metav1.LabelSelector
 			if group.group.Placement != nil {

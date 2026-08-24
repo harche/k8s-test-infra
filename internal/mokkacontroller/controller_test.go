@@ -191,6 +191,66 @@ func TestAllocationRevisionIgnoresOwnedMetadataAndTracksTopologyInputs(t *testin
 	require.EqualValues(t, 3, invalidations.Load())
 }
 
+func TestCapacityTopologyEventsInvalidateAdmissionAndRequeueSurvivors(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	registry := newPlacementRegistry()
+	var allocationInvalidations atomic.Int64
+	var admissionInvalidations atomic.Int64
+	router := newEventRouter(
+		inventories,
+		racks,
+		registry,
+		queues,
+		func() { allocationInvalidations.Add(1) },
+		func() { admissionInvalidations.Add(1) },
+	)
+
+	first := testInventory()
+	second := testInventory()
+	second.Name, second.UID = "second", "second-uid"
+	require.NoError(t, inventories.Add(first))
+	require.NoError(t, inventories.Add(second))
+	registry.replace(first)
+	router.inventoryAdd(second)
+	require.Equal(t, []string{"second"}, drainQueue(queues.inventories),
+		"initial add delivery must remain linear instead of routing all cached keys")
+	drainQueue(queues.status)
+	require.EqualValues(t, 1, allocationInvalidations.Load())
+	require.EqualValues(t, 1, admissionInvalidations.Load())
+
+	resized := second.DeepCopy()
+	resized.Spec.RackGroups[0].Count++
+	require.NoError(t, inventories.Update(resized))
+	router.inventoryUpdate(second, resized)
+	require.ElementsMatch(t, []string{"inventory", "second"}, drainQueue(queues.inventories))
+	drainQueue(queues.status)
+	require.EqualValues(t, 2, allocationInvalidations.Load())
+	require.EqualValues(t, 2, admissionInvalidations.Load())
+
+	profile := &mokkav1alpha1.SGPURackProfile{ObjectMeta: metav1.ObjectMeta{Name: "profile", UID: "profile-uid"}}
+	router.profileAdd(profile)
+	require.ElementsMatch(t, []string{"inventory", "second"}, drainQueue(queues.inventories))
+	drainQueue(queues.status)
+	require.EqualValues(t, 3, allocationInvalidations.Load())
+	require.EqualValues(t, 3, admissionInvalidations.Load())
+
+	updatedProfile := profile.DeepCopy()
+	updatedProfile.Spec.Rack.NodesPerRack = 2
+	router.profileUpdate(profile, updatedProfile)
+	require.ElementsMatch(t, []string{"inventory", "second"}, drainQueue(queues.inventories))
+	drainQueue(queues.status)
+	require.EqualValues(t, 4, allocationInvalidations.Load())
+	require.EqualValues(t, 4, admissionInvalidations.Load())
+
+	router.profileDelete(updatedProfile)
+	require.ElementsMatch(t, []string{"inventory", "second"}, drainQueue(queues.inventories))
+	require.EqualValues(t, 5, allocationInvalidations.Load())
+	require.EqualValues(t, 5, admissionInvalidations.Load())
+}
+
 func TestDeleteTombstonesRouteExactCleanupBeforeGroup(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())

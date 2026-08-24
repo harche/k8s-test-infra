@@ -213,17 +213,21 @@ func (r *placementRegistry) remove(inventory *mokkav1alpha1.SGPUInventory) ([]pl
 		return nil, false
 	}
 	delete(r.byInventory, inventory.Name)
-	survivors := make([]placementInventoryKey, 0, len(r.byInventory))
+	return r.inventoryKeysLocked(), true
+}
+
+func (r *placementRegistry) inventoryKeysLocked() []placementInventoryKey {
+	inventories := make([]placementInventoryKey, 0, len(r.byInventory))
 	for name, registered := range r.byInventory {
-		survivors = append(survivors, placementInventoryKey{name: name, uid: registered.uid})
+		inventories = append(inventories, placementInventoryKey{name: name, uid: registered.uid})
 	}
-	slices.SortFunc(survivors, func(a, b placementInventoryKey) int {
+	slices.SortFunc(inventories, func(a, b placementInventoryKey) int {
 		if order := cmp.Compare(a.name, b.name); order != 0 {
 			return order
 		}
 		return cmp.Compare(string(a.uid), string(b.uid))
 	})
-	return survivors, true
+	return inventories
 }
 
 func (r *placementRegistry) matching(node *corev1.Node) []allocate.GroupKey {
@@ -246,14 +250,15 @@ func (r *placementRegistry) matching(node *corev1.Node) []allocate.GroupKey {
 }
 
 type eventRouter struct {
-	inventories       cache.Indexer
-	racks             cache.Indexer
-	registry          *placementRegistry
-	waiters           *rackConflictWaiters
-	queues            *queues
-	invalidate        func()
-	observeRackStatus func(*mokkav1alpha1.SGPURack)
-	forgetRackStatus  func(string, types.UID)
+	inventories        cache.Indexer
+	racks              cache.Indexer
+	registry           *placementRegistry
+	waiters            *rackConflictWaiters
+	queues             *queues
+	invalidate         func()
+	invalidateCapacity func()
+	observeRackStatus  func(*mokkav1alpha1.SGPURack)
+	forgetRackStatus   func(string, types.UID)
 }
 
 func newEventRouter(
@@ -266,9 +271,13 @@ func newEventRouter(
 	if len(invalidators) > 0 {
 		invalidate = invalidators[0]
 	}
+	var invalidateCapacity func()
+	if len(invalidators) > 1 {
+		invalidateCapacity = invalidators[1]
+	}
 	return &eventRouter{
 		inventories: inventories, racks: racks, registry: registry, waiters: newRackConflictWaiters(),
-		queues: queues, invalidate: invalidate,
+		queues: queues, invalidate: invalidate, invalidateCapacity: invalidateCapacity,
 	}
 }
 
@@ -278,14 +287,24 @@ func (r *eventRouter) invalidateAllocation() {
 	}
 }
 
+func (r *eventRouter) invalidateTopology() {
+	r.invalidateAllocation()
+	if r.invalidateCapacity != nil {
+		r.invalidateCapacity()
+	}
+}
+
 func (r *eventRouter) inventoryAdd(object any) {
 	inventory, ok := eventObject[*mokkav1alpha1.SGPUInventory](object)
 	if !ok {
 		return
 	}
-	r.invalidateAllocation()
+	r.invalidateTopology()
 	r.registry.replace(inventory)
 	r.waiters.retainInventory(inventory)
+	// A newly created Inventory is younger than every existing Inventory, so
+	// oldest-first admission cannot displace a survivor. Routing only the new
+	// key also keeps initial informer delivery linear.
 	r.routeInventory(inventory)
 }
 
@@ -295,8 +314,9 @@ func (r *eventRouter) inventoryUpdate(oldObject, newObject any) {
 	if !oldOK || !newOK {
 		return
 	}
-	if !inventoryAllocationUnchanged(oldInventory, newInventory) {
-		r.invalidateAllocation()
+	topologyChanged := !inventoryAllocationUnchanged(oldInventory, newInventory)
+	if topologyChanged {
+		r.invalidateTopology()
 	}
 	if inventoryUnchanged(oldInventory, newInventory) {
 		return
@@ -308,7 +328,11 @@ func (r *eventRouter) inventoryUpdate(oldObject, newObject any) {
 	}
 	r.registry.replace(newInventory)
 	r.waiters.retainInventory(newInventory)
-	r.routeInventory(newInventory)
+	if topologyChanged {
+		r.routeAllInventories()
+	} else {
+		r.routeInventory(newInventory)
+	}
 }
 
 func (r *eventRouter) inventoryDelete(object any) {
@@ -316,7 +340,7 @@ func (r *eventRouter) inventoryDelete(object any) {
 	if !ok {
 		return
 	}
-	r.invalidateAllocation()
+	r.invalidateTopology()
 	survivors, removed := r.registry.remove(inventory)
 	r.waiters.removeInventory(inventory)
 	r.routeInventory(inventory)
@@ -337,11 +361,21 @@ func (r *eventRouter) routeInventoryKey(inventory placementInventoryKey) {
 	r.queues.addStatus(statusKey{kind: statusInventory, name: inventory.name, uid: inventory.uid})
 }
 
+func (r *eventRouter) routeAllInventories() {
+	for _, object := range r.inventories.List() {
+		inventory, ok := object.(*mokkav1alpha1.SGPUInventory)
+		if !ok {
+			continue
+		}
+		r.routeInventory(inventory)
+	}
+}
+
 func (r *eventRouter) profileAdd(object any) {
-	profile, ok := eventObject[*mokkav1alpha1.SGPURackProfile](object)
+	_, ok := eventObject[*mokkav1alpha1.SGPURackProfile](object)
 	if ok {
-		r.invalidateAllocation()
-		r.routeProfile(profile.Name)
+		r.invalidateTopology()
+		r.routeAllInventories()
 	}
 }
 
@@ -352,38 +386,19 @@ func (r *eventRouter) profileUpdate(oldObject, newObject any) {
 		return
 	}
 	if !profileAllocationUnchanged(oldProfile, newProfile) {
-		r.invalidateAllocation()
+		r.invalidateTopology()
 	}
 	if profileUnchanged(oldProfile, newProfile) {
 		return
 	}
-	r.routeProfile(oldProfile.Name)
-	if oldProfile.Name != newProfile.Name {
-		r.routeProfile(newProfile.Name)
-	}
+	r.routeAllInventories()
 }
 
 func (r *eventRouter) profileDelete(object any) {
-	profile, ok := eventObject[*mokkav1alpha1.SGPURackProfile](object)
+	_, ok := eventObject[*mokkav1alpha1.SGPURackProfile](object)
 	if ok {
-		r.invalidateAllocation()
-		r.routeProfile(profile.Name)
-	}
-}
-
-func (r *eventRouter) routeProfile(name string) {
-	objects, err := r.inventories.ByIndex(controllerack.InventoryByProfileNameIndex, name)
-	if err != nil {
-		klog.Background().Error(err, "Look up inventories by profile", "profile", name)
-		return
-	}
-	for _, object := range objects {
-		inventory, ok := object.(*mokkav1alpha1.SGPUInventory)
-		if !ok {
-			continue
-		}
-		r.queues.inventories.Add(inventory.Name)
-		r.queues.addStatus(statusKey{kind: statusInventory, name: inventory.Name, uid: inventory.UID})
+		r.invalidateTopology()
+		r.routeAllInventories()
 	}
 }
 
