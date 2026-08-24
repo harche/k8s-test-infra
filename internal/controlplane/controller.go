@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,6 +29,7 @@ type Controller struct {
 	config     Config
 	kubeClient kubernetes.Interface
 	reconciler *mokkacontroller.Controller
+	readiness  *electionReadiness
 }
 
 // NewController builds Kubernetes clients and the informer-driven reconciler.
@@ -55,7 +57,10 @@ func NewController(config Config) (*Controller, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create Mokka controller: %w", err)
 	}
-	return &Controller{config: config, kubeClient: kubeClient, reconciler: reconciler}, nil
+	return &Controller{
+		config: config, kubeClient: kubeClient, reconciler: reconciler,
+		readiness: newElectionReadiness(),
+	}, nil
 }
 
 // ValidateControllerConfig rejects settings that cannot make progress safely.
@@ -83,9 +88,11 @@ func ValidateControllerConfig(config Config) error {
 	return nil
 }
 
-// Ready reports whether this replica is leader and all informer caches synced.
+// Ready reports whether this replica can participate in controller service.
+// Standbys become ready after observing the Lease; a leader additionally waits
+// for every informer cache to synchronize.
 func (c *Controller) Ready() bool {
-	return c != nil && c.reconciler.Ready()
+	return c != nil && c.reconciler != nil && c.readiness != nil && c.readiness.ready(c.reconciler.Ready())
 }
 
 // Run participates in Lease election and runs workers only while leading.
@@ -101,7 +108,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		Client:     c.kubeClient.CoordinationV1(),
 		LockConfig: rl.ResourceLockConfig{Identity: identity},
 	}
-	return runLeaderElection(ctx, c.config, lock, c.reconciler.Run)
+	return runLeaderElection(ctx, c.config, lock, c.reconciler.Run, c.readiness)
 }
 
 func controllerRESTConfig(config Config) (*rest.Config, error) {
@@ -132,13 +139,32 @@ func leaderIdentity() (string, error) {
 	return hostname + "_" + uuid.NewString(), nil
 }
 
-func newLeaderElectionConfig(config Config, lock rl.Interface, run func(context.Context)) leaderelection.LeaderElectionConfig {
+func newLeaderElectionConfig(
+	config Config,
+	lock rl.Interface,
+	run func(context.Context),
+	readiness *electionReadiness,
+) leaderelection.LeaderElectionConfig {
+	onStartedLeading := run
+	onStoppedLeading := func() {}
+	var onNewLeader func(string)
+	if readiness != nil {
+		onStartedLeading = func(ctx context.Context) {
+			readiness.startLeading()
+			run(ctx)
+		}
+		onStoppedLeading = readiness.stop
+		onNewLeader = func(identity string) {
+			readiness.observeLeader(identity == lock.Identity())
+		}
+	}
 	return leaderelection.LeaderElectionConfig{
 		Lock: lock, LeaseDuration: config.LeaseDuration, RenewDeadline: config.RenewDeadline,
 		RetryPeriod: config.RetryPeriod, ReleaseOnCancel: true, Name: config.LeaderElectionName,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: run,
-			OnStoppedLeading: func() {},
+			OnStartedLeading: onStartedLeading,
+			OnStoppedLeading: onStoppedLeading,
+			OnNewLeader:      onNewLeader,
 		},
 	}
 }
@@ -148,12 +174,19 @@ func runLeaderElection(
 	config Config,
 	lock rl.Interface,
 	run func(context.Context) error,
+	readiness *electionReadiness,
 ) error {
+	if readiness != nil {
+		readiness.start()
+		defer readiness.stop()
+	}
 	electionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	work := newLeaderWork()
 	draining := &drainingLock{Interface: lock, workDone: work.done, stopWork: cancel}
-	electionConfig := newLeaderElectionConfig(config, draining, work.onStartedLeading(run, cancel))
+	electionConfig := newLeaderElectionConfig(
+		config, draining, work.onStartedLeading(run, cancel), readiness,
+	)
 	elector, err := leaderelection.NewLeaderElector(electionConfig)
 	if err != nil {
 		return fmt.Errorf("configure leader election: %w", err)
@@ -165,6 +198,66 @@ func runLeaderElection(
 	}
 	<-work.done
 	return work.result()
+}
+
+type electionReadinessState uint8
+
+const (
+	electionStopped electionReadinessState = iota
+	electionWaiting
+	electionStandby
+	electionLeader
+)
+
+type electionReadiness struct {
+	state atomic.Uint32
+}
+
+func newElectionReadiness() *electionReadiness {
+	return &electionReadiness{}
+}
+
+func (r *electionReadiness) start() {
+	r.state.Store(uint32(electionWaiting))
+}
+
+func (r *electionReadiness) observeLeader(self bool) {
+	if self {
+		r.startLeading()
+		return
+	}
+	// OnNewLeader callbacks run asynchronously. Once this replica is elected,
+	// a delayed observation of the previous leader must not mark it standby.
+	r.state.CompareAndSwap(uint32(electionWaiting), uint32(electionStandby))
+}
+
+func (r *electionReadiness) startLeading() {
+	for {
+		state := electionReadinessState(r.state.Load())
+		switch state {
+		case electionWaiting, electionStandby:
+			if r.state.CompareAndSwap(uint32(state), uint32(electionLeader)) {
+				return
+			}
+		case electionStopped, electionLeader:
+			return
+		}
+	}
+}
+
+func (r *electionReadiness) stop() {
+	r.state.Store(uint32(electionStopped))
+}
+
+func (r *electionReadiness) ready(leaderReady bool) bool {
+	switch electionReadinessState(r.state.Load()) {
+	case electionStandby:
+		return true
+	case electionLeader:
+		return leaderReady
+	default:
+		return false
+	}
 }
 
 type leaderWork struct {

@@ -217,7 +217,9 @@ tests:
             targetPort: http
             protocol: TCP
 
-  - it: should honour a custom image, replicas, and log level
+  # Every active/passive replica must converge Ready; the elected replica
+  # additionally waits for controller cache synchronization.
+  - it: should honour ready active-passive replicas, a custom image, and log level
     set:
       controlPlane:
         enabled: true
@@ -232,6 +234,12 @@ tests:
       - equal:
           path: spec.replicas
           value: 3
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
       - equal:
           path: spec.template.spec.containers[0].image
           value: registry.example.com/mokka-cp:v0.1.0

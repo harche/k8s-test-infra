@@ -99,10 +99,11 @@ Node UID no longer exists, cleanup may proceed without touching a same-name
 replacement. The singleton ClusterRoleBinding ensures only the owning release
 has cluster permissions. Within that release, its namespace-local Lease
 prevents replicas from reconciling concurrently; cluster-wide Lease permissions
-are unnecessary under the single-installation invariant. Upgrades use a
-`Recreate` Deployment strategy because only the elected leader reports ready;
-this deliberately trades a short reconciliation pause for deterministic
-singleton replacement.
+are unnecessary under the single-installation invariant. Standbys report ready
+after observing the elected leader. The leader reports ready after its informer
+caches synchronize, so multi-replica rollouts converge without allowing standby
+mutation. Upgrades retain a `Recreate` Deployment strategy for deterministic
+whole-generation replacement.
 
 ## Stage 1 exclusions
 

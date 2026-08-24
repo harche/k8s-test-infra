@@ -46,7 +46,7 @@ func TestLeaderConfigWaitsForControllerBeforeLeaseRelease(t *testing.T) {
 		Interface: baseLock, workDone: workDone,
 		stopWork: func() { close(workCanceled) },
 	}
-	election := newLeaderElectionConfig(config, lock, func(context.Context) {})
+	election := newLeaderElectionConfig(config, lock, func(context.Context) {}, nil)
 
 	require.True(t, election.ReleaseOnCancel)
 	require.Equal(t, config.LeaseDuration, election.LeaseDuration)
@@ -63,6 +63,51 @@ func TestLeaderConfigWaitsForControllerBeforeLeaseRelease(t *testing.T) {
 	close(workDone)
 	<-released
 	require.Equal(t, 1, baseLock.updateCalls())
+}
+
+func TestElectionReadinessCoversStandbyAndLeaderLifecycle(t *testing.T) {
+	readiness := newElectionReadiness()
+	leaderReady := false
+	isReady := func() bool { return readiness.ready(leaderReady) }
+
+	require.False(t, isReady(), "a replica must not be ready before leader election starts")
+	readiness.start()
+	require.False(t, isReady(), "a replica must not be ready before it reaches the Lease")
+
+	readiness.observeLeader(false)
+	require.True(t, isReady(), "a standby that observes the elected leader can take over")
+
+	readiness.observeLeader(true)
+	require.False(t, isReady(), "a newly elected leader must wait for its informer caches")
+	readiness.observeLeader(false)
+	require.False(t, isReady(), "a delayed standby callback must not downgrade the elected state")
+
+	leaderReady = true
+	require.True(t, isReady(), "an elected leader is ready after its caches synchronize")
+
+	readiness.stop()
+	require.False(t, isReady(), "a stopped election participant must not remain ready")
+	readiness.observeLeader(false)
+	readiness.observeLeader(true)
+	require.False(t, isReady(), "callbacks arriving after shutdown must be ignored")
+}
+
+func TestLeaderConfigPublishesElectionReadiness(t *testing.T) {
+	config := DefaultConfig()
+	lock := &fakeResourceLock{identity: "replica"}
+	readiness := newElectionReadiness()
+	readiness.start()
+	election := newLeaderElectionConfig(config, lock, func(context.Context) {}, readiness)
+
+	election.Callbacks.OnNewLeader("other-replica")
+	require.True(t, readiness.ready(false))
+
+	election.Callbacks.OnNewLeader(lock.Identity())
+	require.False(t, readiness.ready(false))
+	require.True(t, readiness.ready(true))
+
+	election.Callbacks.OnStoppedLeading()
+	require.False(t, readiness.ready(true))
 }
 
 func TestLeaderElectionDrainsWorkBeforeRelease(t *testing.T) {
@@ -88,7 +133,7 @@ func testLeaderElectionDrain(t *testing.T, loseLease bool) {
 			<-workCtx.Done()
 			close(workStopped)
 			return nil
-		})
+		}, nil)
 	}()
 
 	select {

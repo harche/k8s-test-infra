@@ -29,7 +29,7 @@ func NewServer(cfg Config, logger *slog.Logger) *Server {
 	return NewServerWithReadiness(cfg, logger, func() bool { return true })
 }
 
-// NewServerWithReadiness gates /readyz on controller cache readiness.
+// NewServerWithReadiness gates /readyz on controller service readiness.
 func NewServerWithReadiness(cfg Config, logger *slog.Logger, ready func() bool) *Server {
 	if ready == nil {
 		ready = func() bool { return false }

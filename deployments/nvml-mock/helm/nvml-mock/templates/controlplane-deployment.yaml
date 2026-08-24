@@ -10,9 +10,8 @@ metadata:
     app.kubernetes.io/component: control-plane
 spec:
   replicas: {{ .Values.controlPlane.replicas }}
-  # Only the elected leader reports ready. A singleton RollingUpdate would
-  # retain the old leader while waiting forever for its standby to become
-  # ready, so upgrades deliberately accept a short reconciliation pause.
+  # Leader election coordinates active/passive replicas within a generation;
+  # Recreate keeps whole-generation replacement deterministic.
   strategy:
     type: Recreate
   selector:
