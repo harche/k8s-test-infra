@@ -10,6 +10,11 @@ metadata:
     app.kubernetes.io/component: control-plane
 spec:
   replicas: {{ .Values.controlPlane.replicas }}
+  # Only the elected leader reports ready. A singleton RollingUpdate would
+  # retain the old leader while waiting forever for its standby to become
+  # ready, so upgrades deliberately accept a short reconciliation pause.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "nvml-mock.controlPlaneSelectorLabels" . | nindent 6 }}
