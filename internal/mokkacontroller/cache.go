@@ -111,6 +111,25 @@ func (c *informerCache) RacksByNodeUID(uid types.UID) ([]*mokkav1alpha1.SGPURack
 	return castRacks(objects)
 }
 
+func (c *informerCache) ProjectionTarget(
+	rack *mokkav1alpha1.SGPURack,
+	slot *mokkav1alpha1.SGPURackNode,
+) (*corev1.Node, bool, error) {
+	if rack == nil || slot == nil || slot.NodeRef == nil {
+		return nil, false, nil
+	}
+	record, exists := c.nodes.GetByName(slot.NodeRef.Name)
+	if !exists || record.Node().UID != slot.NodeRef.UID {
+		return nil, false, nil
+	}
+	node := record.Node()
+	allowed, err := controllerack.ProjectionTargetAllowed(c, rack, slot, node)
+	if err != nil || !allowed {
+		return nil, allowed, err
+	}
+	return node, true, nil
+}
+
 func (c *informerCache) AllocationNodeGeneration() uint64 {
 	return c.nodes.Generation()
 }

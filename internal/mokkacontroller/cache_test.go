@@ -6,6 +6,7 @@ package mokkacontroller
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,9 +14,29 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	mokkav1alpha1 "github.com/NVIDIA/k8s-test-infra/internal/controlplane/api/v1alpha1"
 	controllernodes "github.com/NVIDIA/k8s-test-infra/internal/mokkacontroller/nodecatalog"
 	"github.com/stretchr/testify/require"
 )
+
+func TestProjectionTargetDoesNotLiveGetNodeOutsideEligibleCache(t *testing.T) {
+	live := &countingNodeGetter{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node", UID: "node-uid",
+	}}}
+	snapshot := newInformerCache(nil, nil, nil, controllernodes.New(), live, DefaultOptions())
+	rack := &mokkav1alpha1.SGPURack{Spec: mokkav1alpha1.SGPURackSpec{
+		Nodes: []mokkav1alpha1.SGPURackNode{{
+			Index: 0, NodeRef: &mokkav1alpha1.SGPUNodeReference{Name: live.node.Name, UID: live.node.UID},
+		}},
+	}}
+
+	node, allowed, err := snapshot.ProjectionTarget(rack, &rack.Spec.Nodes[0])
+
+	require.NoError(t, err)
+	require.False(t, allowed)
+	require.Nil(t, node)
+	require.Zero(t, live.calls.Load())
+}
 
 func TestLiveNodeFallbackUsesCallerContextAndDeadline(t *testing.T) {
 	live := newBlockingNodeGetter(false)
@@ -74,6 +95,21 @@ type blockingNodeGetter struct {
 	finished           chan struct{}
 	release            chan struct{}
 	ignoreCancellation bool
+}
+
+type countingNodeGetter struct {
+	corev1client.NodeInterface
+	node  *corev1.Node
+	calls atomic.Int64
+}
+
+func (g *countingNodeGetter) Get(
+	_ context.Context,
+	_ string,
+	_ metav1.GetOptions,
+) (*corev1.Node, error) {
+	g.calls.Add(1)
+	return g.node.DeepCopy(), nil
 }
 
 func newBlockingNodeGetter(ignoreCancellation bool) *blockingNodeGetter {

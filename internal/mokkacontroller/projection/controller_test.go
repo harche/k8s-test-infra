@@ -67,6 +67,28 @@ func TestProjectAppliesOnlyOwnedMetadataWithExactAssignment(t *testing.T) {
 	require.Equal(t, []Outcome{outcome}, controller.Outcomes())
 }
 
+func TestProjectRejectsUnauthorizedProjectionTargetBeforeNodeAccess(t *testing.T) {
+	rack := testRack()
+	cache := &fakeCache{
+		racks: map[string]*mokkav1alpha1.SGPURack{rack.Name: rack},
+		projectionTarget: func(*mokkav1alpha1.SGPURack, *mokkav1alpha1.SGPURackNode) (*corev1.Node, bool, error) {
+			return nil, false, nil
+		},
+		nodeLookup: func(context.Context, string) (*corev1.Node, error) {
+			t.Fatal("an unauthorized projection must not fall back to a live Node GET")
+			return nil, nil
+		},
+	}
+	patcher := &recordingPatcher{}
+
+	outcome, err := NewController(cache, patcher).Project(context.Background(), rack.Name, 0)
+
+	require.NoError(t, err)
+	require.Equal(t, StateAbsent, outcome.State)
+	require.Equal(t, ReasonBindingNotAllocated, outcome.Reason)
+	require.Empty(t, patcher.calls)
+}
+
 func TestProjectSkipsApplyForExactOwnedProjection(t *testing.T) {
 	rack := testRack()
 	node := testNode("node", "node-uid")
@@ -774,9 +796,27 @@ func TestProjectionStateConcurrentAccess(t *testing.T) {
 }
 
 type fakeCache struct {
-	nodes      map[string]*corev1.Node
-	racks      map[string]*mokkav1alpha1.SGPURack
-	nodeLookup func(context.Context, string) (*corev1.Node, error)
+	nodes            map[string]*corev1.Node
+	racks            map[string]*mokkav1alpha1.SGPURack
+	nodeLookup       func(context.Context, string) (*corev1.Node, error)
+	projectionTarget func(
+		*mokkav1alpha1.SGPURack,
+		*mokkav1alpha1.SGPURackNode,
+	) (*corev1.Node, bool, error)
+}
+
+func (f *fakeCache) ProjectionTarget(
+	rack *mokkav1alpha1.SGPURack,
+	slot *mokkav1alpha1.SGPURackNode,
+) (*corev1.Node, bool, error) {
+	if f.projectionTarget != nil {
+		return f.projectionTarget(rack, slot)
+	}
+	node := f.nodes[slot.NodeRef.Name]
+	if node == nil || node.UID != slot.NodeRef.UID {
+		return nil, false, nil
+	}
+	return node, true, nil
 }
 
 func (f *fakeCache) Node(ctx context.Context, name string) (*corev1.Node, error) {

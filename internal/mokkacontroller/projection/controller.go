@@ -84,6 +84,7 @@ const (
 	ReasonExactNodeAbsent      = "ExactNodeAbsent"
 	ReasonNodeMetadataConflict = "NodeMetadataConflict"
 	ReasonDuplicateBinding     = "DuplicateBinding"
+	ReasonBindingNotAllocated  = "BindingNotAllocated"
 	ReasonProjectionError      = "ProjectionError"
 )
 
@@ -117,6 +118,7 @@ func (e *MetadataConflictError) Error() string {
 // Cache is the informer-backed read surface needed for one projection.
 type Cache interface {
 	Node(context.Context, string) (*corev1.Node, error)
+	ProjectionTarget(*mokkav1alpha1.SGPURack, *mokkav1alpha1.SGPURackNode) (*corev1.Node, bool, error)
 	Rack(string) (*mokkav1alpha1.SGPURack, error)
 	RacksByNodeUID(types.UID) ([]*mokkav1alpha1.SGPURack, error)
 }
@@ -224,6 +226,14 @@ func (c *Controller) project(ctx context.Context, rackName string, nodeIndex int
 		outcome.State, outcome.Reason = StateCleaned, ReasonCleaned
 		return outcome, nil
 	}
+	node, allowed, err := c.cache.ProjectionTarget(rack, slot)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("authorize rack %q logical Node %d projection: %w", rackName, nodeIndex, err)
+	}
+	if !allowed {
+		outcome.State, outcome.Reason = StateAbsent, ReasonBindingNotAllocated
+		return outcome, nil
+	}
 	c.beginProjection(rack, slot)
 
 	duplicates, err := c.duplicateBindings(slot.NodeRef.UID)
@@ -235,21 +245,6 @@ func (c *Controller) project(ctx context.Context, rackName string, nodeIndex int
 		outcome.State, outcome.Reason, outcome.Message = StateConflict, ReasonDuplicateBinding, err.Error()
 		c.record(outcome)
 		return outcome, err
-	}
-
-	node, err := c.cache.Node(ctx, slot.NodeRef.Name)
-	if apierrors.IsNotFound(err) {
-		outcome.State, outcome.Reason = StateAbsent, ReasonExactNodeAbsent
-		c.record(outcome)
-		return outcome, nil
-	}
-	if err != nil {
-		return c.fail(outcome, fmt.Errorf("get Node %q: %w", slot.NodeRef.Name, err))
-	}
-	if node.UID != slot.NodeRef.UID {
-		outcome.State, outcome.Reason = StateAbsent, ReasonExactNodeAbsent
-		c.record(outcome)
-		return outcome, nil
 	}
 
 	assignment, err := EncodeAssignment(rack, slot)

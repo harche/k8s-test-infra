@@ -90,6 +90,20 @@ func TestControllerOwnedFreeRackAddContinuesPendingAllocation(t *testing.T) {
 		"observing the recreated free slot must reconsider a replacement left pending against stale cache state")
 }
 
+func TestForeignRackBindingDoesNotRouteProjection(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
+	rack := testRack(testNode())
+	rack.OwnerReferences = nil
+
+	router.rackAdd(rack)
+
+	require.Empty(t, drainQueue(queues.projections))
+}
+
 func TestRackOwnerRoutingUsesControllerReferenceWhenInventoryRefDrifts(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())

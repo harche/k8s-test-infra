@@ -586,12 +586,14 @@ func (r *eventRouter) routeRackCurrent(rack *mokkav1alpha1.SGPURack, reconcile b
 	if reconcile {
 		r.routeRackDependencies(rack)
 	}
-	for _, slot := range rack.Spec.Nodes {
-		if slot.NodeRef != nil {
-			r.queues.projections.Add(projectionKey{
-				mode: projectionApply, rackName: rack.Name, nodeIndex: slot.Index,
-				fresh: fresh[slot.Index] == slot.NodeRef.UID,
-			})
+	if rackOwnedByReference(rack) {
+		for _, slot := range rack.Spec.Nodes {
+			if slot.NodeRef != nil {
+				r.queues.projections.Add(projectionKey{
+					mode: projectionApply, rackName: rack.Name, nodeIndex: slot.Index,
+					fresh: fresh[slot.Index] == slot.NodeRef.UID,
+				})
+			}
 		}
 	}
 	r.queues.addStatus(statusKey{kind: statusRack, name: rack.Name, uid: rack.UID})
