@@ -310,7 +310,6 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 	}
 	controller.reconcileProjection = func(ctx context.Context, key projectionKey) error {
 		var err error
-		terminalConflict := false
 		switch key.mode {
 		case projectionApply:
 			rack, getErr := snapshot.Rack(key.rackName)
@@ -332,7 +331,6 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 			} else {
 				_, err = projection.Project(ctx, key.rackName, key.nodeIndex)
 			}
-			terminalConflict = metadataConflict(err)
 			controller.queues.addStatus(statusKey{kind: statusRack, name: rack.Name, uid: rack.UID})
 			controller.queues.addStatus(statusKey{kind: statusInventory, name: rack.Spec.InventoryRef.Name, uid: rack.Spec.InventoryRef.UID})
 		case projectionCleanup:
@@ -342,7 +340,6 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 				outcome, cleanupErr = projection.Cleanup(ctx, key.cleanup)
 				return cleanupErr
 			})
-			terminalConflict = metadataConflict(err)
 			if err == nil && outcome.State == controllerprojection.StateCleaned {
 				switch key.cleanup.Reason {
 				case controllerack.CleanupCapacityShrink,
@@ -364,10 +361,7 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 		default:
 			return fmt.Errorf("unknown projection work mode %d", key.mode)
 		}
-		if terminalConflict {
-			return nil
-		}
-		return err
+		return projectionRetryError(key.mode, err)
 	}
 	controller.reconcileStatus = func(ctx context.Context, key statusKey) error {
 		switch key.kind {
@@ -450,6 +444,13 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 func metadataConflict(err error) bool {
 	var conflict *controllerprojection.MetadataConflictError
 	return errors.As(err, &conflict)
+}
+
+func projectionRetryError(mode projectionMode, err error) error {
+	if mode == projectionApply && metadataConflict(err) {
+		return nil
+	}
+	return err
 }
 
 func updateRackConflictWaiters(

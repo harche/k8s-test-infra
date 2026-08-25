@@ -731,6 +731,50 @@ func TestProcessNextRateLimitsErrorsAndForgetsSuccess(t *testing.T) {
 	require.Zero(t, queue.NumRequeues("key"))
 }
 
+func TestProjectionConflictWorkerRetryPolicy(t *testing.T) {
+	conflict := &controllerprojection.MetadataConflictError{NodeName: "node"}
+
+	t.Run("cleanup retries and succeeds without another event", func(t *testing.T) {
+		queue := workqueue.NewTypedRateLimitingQueue(
+			workqueue.NewTypedItemFastSlowRateLimiter[projectionKey](0, 0, 1),
+		)
+		t.Cleanup(queue.ShutDown)
+		key := projectionKey{mode: projectionCleanup}
+		queue.Add(key)
+		attempts := 0
+
+		reconcile := func(context.Context, projectionKey) error {
+			attempts++
+			if attempts == 1 {
+				return projectionRetryError(key.mode, conflict)
+			}
+			return nil
+		}
+		require.True(t, processNext(context.Background(), queue, reconcile))
+		require.Equal(t, 1, queue.NumRequeues(key))
+		require.Eventually(t, func() bool { return queue.Len() == 1 }, time.Second, time.Millisecond)
+
+		require.True(t, processNext(context.Background(), queue, reconcile))
+		require.Equal(t, 2, attempts, "the workqueue retry is the only second trigger")
+		require.Zero(t, queue.NumRequeues(key))
+	})
+
+	t.Run("apply remains terminal", func(t *testing.T) {
+		queue := workqueue.NewTypedRateLimitingQueue(
+			workqueue.NewTypedItemFastSlowRateLimiter[projectionKey](0, 0, 1),
+		)
+		t.Cleanup(queue.ShutDown)
+		key := projectionKey{mode: projectionApply}
+		queue.Add(key)
+
+		require.True(t, processNext(context.Background(), queue, func(context.Context, projectionKey) error {
+			return projectionRetryError(key.mode, conflict)
+		}))
+		require.Zero(t, queue.NumRequeues(key))
+		require.Zero(t, queue.Len())
+	})
+}
+
 func TestProcessNextDistinguishesRequestTimeoutFromCallerShutdown(t *testing.T) {
 	t.Run("request timeout retries while caller remains active", func(t *testing.T) {
 		queue := workqueue.NewTypedRateLimitingQueue(
