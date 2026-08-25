@@ -1933,6 +1933,10 @@ func (d *ConfigurableDevice) GetMemoryErrorCounter(errorType nvml.MemoryErrorTyp
 	return count, nvml.SUCCESS
 }
 
+func (d *ConfigurableDevice) supportsSramEccErrorStatus() bool {
+	return d.Config.Architecture >= nvml.DEVICE_ARCH_AMPERE && d.Config.Architecture != nvml.DEVICE_ARCH_UNKNOWN
+}
+
 // GetSramEccErrorStatus returns the on-die SRAM ECC error state from ecc.sram.
 // SRAM errors are the fault class that row remapping cannot repair, so
 // fault-handling software treats them differently from DRAM errors and reads
@@ -1943,6 +1947,10 @@ func (d *ConfigurableDevice) GetMemoryErrorCounter(errorType nvml.MemoryErrorTyp
 func (d *ConfigurableDevice) GetSramEccErrorStatus() (nvml.EccSramErrorStatus, nvml.Return) {
 	if ret := d.tickFailure(); ret != nvml.SUCCESS {
 		return nvml.EccSramErrorStatus{}, ret
+	}
+	if !d.supportsSramEccErrorStatus() {
+		debugLog("[NVML] nvmlDeviceGetSramEccErrorStatus -> NOT_SUPPORTED (architecture=%d)\n", d.Config.Architecture)
+		return nvml.EccSramErrorStatus{}, nvml.ERROR_NOT_SUPPORTED
 	}
 	// SRAM counters only exist while ECC is on. Reporting zeros for a GPU with
 	// ECC disabled would claim healthy SRAM the driver is not actually

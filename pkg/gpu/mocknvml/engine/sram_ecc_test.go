@@ -28,7 +28,7 @@ func eccEnabled() *ECCConfig {
 }
 
 func TestSramEccErrorStatus_HealthyDeviceReportsZeroNotUnsupported(t *testing.T) {
-	dev := newTestDeviceWithConfig(t, &DeviceConfig{ECC: eccEnabled()})
+	dev := newTestDeviceWithConfig(t, &DeviceConfig{Architecture: "ampere", ECC: eccEnabled()})
 
 	status, ret := dev.GetSramEccErrorStatus()
 	require.Equal(t, nvml.SUCCESS, ret,
@@ -36,9 +36,38 @@ func TestSramEccErrorStatus_HealthyDeviceReportsZeroNotUnsupported(t *testing.T)
 	require.Equal(t, nvml.EccSramErrorStatus{}, status, "a healthy GPU reports every SRAM counter as zero")
 }
 
+func TestSramEccErrorStatus_ArchitectureSupport(t *testing.T) {
+	tests := []struct {
+		name         string
+		architecture string
+		expected     nvml.Return
+	}{
+		{name: "unknown", architecture: "unknown", expected: nvml.ERROR_NOT_SUPPORTED},
+		{name: "Volta", architecture: "volta", expected: nvml.ERROR_NOT_SUPPORTED},
+		{name: "T4 Turing", architecture: "turing", expected: nvml.ERROR_NOT_SUPPORTED},
+		{name: "Ampere", architecture: "ampere", expected: nvml.SUCCESS},
+		{name: "Ada", architecture: "ada", expected: nvml.SUCCESS},
+		{name: "Hopper", architecture: "hopper", expected: nvml.SUCCESS},
+		{name: "Blackwell", architecture: "blackwell", expected: nvml.SUCCESS},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := newTestDeviceWithConfig(t, &DeviceConfig{
+				Architecture: tt.architecture,
+				ECC:          eccEnabled(),
+			})
+
+			_, ret := dev.GetSramEccErrorStatus()
+			require.Equal(t, tt.expected, ret)
+		})
+	}
+}
+
 func TestSramEccErrorStatus_UnsupportedWhenEccDisabled(t *testing.T) {
 	dev := newTestDeviceWithConfig(t, &DeviceConfig{
-		ECC: &ECCConfig{ModeCurrent: "disabled", ModePending: "disabled"},
+		Architecture: "ampere",
+		ECC:          &ECCConfig{ModeCurrent: "disabled", ModePending: "disabled"},
 	})
 
 	_, ret := dev.GetSramEccErrorStatus()
@@ -48,6 +77,7 @@ func TestSramEccErrorStatus_UnsupportedWhenEccDisabled(t *testing.T) {
 
 func TestSramEccErrorStatus_ReportsConfiguredCounters(t *testing.T) {
 	dev := newTestDeviceWithConfig(t, &DeviceConfig{
+		Architecture: "ampere",
 		ECC: &ECCConfig{
 			ModeCurrent: "enabled",
 			ModePending: "enabled",
@@ -94,8 +124,9 @@ func TestSramEccErrorStatus_ReportsConfiguredCounters(t *testing.T) {
 
 func TestSramEccErrorStatus_LostDeviceReportsGpuIsLost(t *testing.T) {
 	dev := newTestDeviceWithConfig(t, &DeviceConfig{
-		ECC:     eccEnabled(),
-		Failure: &FailureInjectionConfig{Mode: FailureModeLost},
+		Architecture: "turing",
+		ECC:          eccEnabled(),
+		Failure:      &FailureInjectionConfig{Mode: FailureModeLost},
 	})
 
 	_, ret := dev.GetSramEccErrorStatus()
@@ -107,6 +138,7 @@ func TestSramEccErrorStatus_LostDeviceReportsGpuIsLost(t *testing.T) {
 // the fix: one shared counter for every location made the argument meaningless.
 func TestMemoryErrorCounter_DistinguishesDramFromSram(t *testing.T) {
 	dev := newTestDeviceWithConfig(t, &DeviceConfig{
+		Architecture: "turing",
 		ECC: &ECCConfig{
 			ModeCurrent: "enabled",
 			ModePending: "enabled",
@@ -127,7 +159,8 @@ func TestMemoryErrorCounter_DistinguishesDramFromSram(t *testing.T) {
 
 	sram, ret := dev.GetMemoryErrorCounter(nvml.MEMORY_ERROR_TYPE_UNCORRECTED, nvml.AGGREGATE_ECC, nvml.MEMORY_LOCATION_SRAM)
 	require.Equal(t, nvml.SUCCESS, ret)
-	require.Equal(t, uint64(5), sram, "SRAM uncorrectable is parity + SEC-DED, and must not read the DRAM counter")
+	require.Equal(t, uint64(5), sram,
+		"the legacy SRAM location counter remains available on Turing and must not read the DRAM counter")
 
 	l2, ret := dev.GetMemoryErrorCounter(nvml.MEMORY_ERROR_TYPE_UNCORRECTED, nvml.AGGREGATE_ECC, nvml.MEMORY_LOCATION_L2_CACHE)
 	require.Equal(t, nvml.SUCCESS, ret)
