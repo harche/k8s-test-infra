@@ -345,6 +345,10 @@ func (w *recordingRackWriter) Get(context.Context, string, metav1.GetOptions) (*
 	return w.getResult, w.getErr
 }
 
+func (*recordingRackWriter) List(context.Context, metav1.ListOptions) (*mokkav1alpha1.SGPURackList, error) {
+	return &mokkav1alpha1.SGPURackList{}, nil
+}
+
 func (w *recordingRackWriter) Patch(
 	_ context.Context,
 	name string,

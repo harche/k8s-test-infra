@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -48,13 +49,18 @@ type InventoryMutations interface {
 	Update(context.Context, *mokkav1alpha1.SGPUInventory, metav1.UpdateOptions) (*mokkav1alpha1.SGPUInventory, error)
 }
 
-// Mutations is the narrow live-client surface used for rack writes.
+// Mutations is the narrow live-client surface used for rack lifecycle operations.
 type Mutations interface {
 	Create(context.Context, *mokkav1alpha1.SGPURack, metav1.CreateOptions) (*mokkav1alpha1.SGPURack, error)
 	Get(context.Context, string, metav1.GetOptions) (*mokkav1alpha1.SGPURack, error)
+	List(context.Context, metav1.ListOptions) (*mokkav1alpha1.SGPURackList, error)
 	Patch(context.Context, string, types.PatchType, []byte, metav1.PatchOptions, ...string) (*mokkav1alpha1.SGPURack, error)
 	Delete(context.Context, string, metav1.DeleteOptions) error
 }
+
+// ErrRackCacheStale requests a rate-limited retry after a live rack missing
+// from the informer cache has been retired.
+var ErrRackCacheStale = errors.New("owned rack is missing from the informer cache")
 
 // CleanupReason identifies why a durable binding must be removed.
 type CleanupReason string
@@ -750,20 +756,82 @@ func (r *Reconciler) reconcileInventoryDeletion(
 		}
 	}
 	if allGone && slices.Contains(inventory.Finalizers, InventoryFinalizer) {
-		changed, err := r.mutateInventory(ctx, inventory, func(latest *mokkav1alpha1.SGPUInventory) bool {
-			if !slices.Contains(latest.Finalizers, InventoryFinalizer) {
-				return false
-			}
-			latest.Finalizers = removeString(latest.Finalizers, InventoryFinalizer)
-			return true
-		})
-		if err != nil {
-			return result, err
-		}
-		result.Changed = result.Changed || changed
+		var err error
+		result, err = r.reconcileTerminalInventoryDeletion(ctx, inventory, result)
+		sortResult(&result)
+		return result, err
 	}
 	sortResult(&result)
 	return result, nil
+}
+
+func (r *Reconciler) reconcileTerminalInventoryDeletion(
+	ctx context.Context,
+	inventory *mokkav1alpha1.SGPUInventory,
+	result Result,
+) (Result, error) {
+	liveRacks, err := r.liveOwnedRacks(ctx, inventory)
+	if err != nil {
+		return result, err
+	}
+	if len(liveRacks) > 0 {
+		return r.retireLiveOwnedRacks(ctx, inventory, liveRacks, result)
+	}
+	changed, err := r.mutateInventory(ctx, inventory, func(latest *mokkav1alpha1.SGPUInventory) bool {
+		if !slices.Contains(latest.Finalizers, InventoryFinalizer) {
+			return false
+		}
+		latest.Finalizers = removeString(latest.Finalizers, InventoryFinalizer)
+		return true
+	})
+	if err != nil {
+		return result, err
+	}
+	result.Changed = result.Changed || changed
+	return result, nil
+}
+
+func (r *Reconciler) retireLiveOwnedRacks(
+	ctx context.Context,
+	inventory *mokkav1alpha1.SGPUInventory,
+	racks []*mokkav1alpha1.SGPURack,
+	result Result,
+) (Result, error) {
+	for _, rack := range racks {
+		changed, cleanup, err := r.retireRack(ctx, inventory, rack, CleanupInventoryDeleting)
+		if err != nil {
+			appendOwnershipConflict(&result, err)
+			return result, err
+		}
+		result.Changed = result.Changed || changed
+		result.CleanupNeeded = append(result.CleanupNeeded, cleanup...)
+	}
+	return result, fmt.Errorf("%w for inventory %q", ErrRackCacheStale, inventory.Name)
+}
+
+func (r *Reconciler) liveOwnedRacks(
+	ctx context.Context,
+	inventory *mokkav1alpha1.SGPUInventory,
+) ([]*mokkav1alpha1.SGPURack, error) {
+	options := metav1.ListOptions{}
+	// Controller-created racks always carry this label when the inventory name
+	// is a valid value. Fall back to an unscoped list when that invariant cannot
+	// hold so the final absence check remains complete.
+	if len(validation.IsValidLabelValue(inventory.Name)) == 0 {
+		options.LabelSelector = labels.Set{InventoryNameLabel: inventory.Name}.String()
+	}
+	live, err := r.racks.List(ctx, options)
+	if err != nil {
+		return nil, fmt.Errorf("list live racks for inventory %q: %w", inventory.Name, err)
+	}
+	if live == nil {
+		return nil, fmt.Errorf("list live racks for inventory %q returned no object", inventory.Name)
+	}
+	racks := make([]*mokkav1alpha1.SGPURack, 0, len(live.Items))
+	for i := range live.Items {
+		racks = append(racks, &live.Items[i])
+	}
+	return filterOwnedRacks(racks, inventory), nil
 }
 
 func (r *Reconciler) createOrUpdateRack(

@@ -275,7 +275,7 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 			result, err := rackReconciler.Reconcile(ctx, name)
 			if err != nil {
 				var ownershipErr *controllerack.OwnershipConflictError
-				if errors.As(err, &ownershipErr) {
+				if errors.As(err, &ownershipErr) || errors.Is(err, controllerack.ErrRackCacheStale) {
 					if statusErr := finishRackReconcile(name, nil, observed, result); statusErr != nil {
 						return errors.Join(err, statusErr)
 					}
@@ -298,7 +298,7 @@ func newForNodes(nodes corev1client.NodeInterface, mokkaClient versioned.Interfa
 			result, err := rackReconciler.ReconcileGroup(ctx, key)
 			if err != nil {
 				var ownershipErr *controllerack.OwnershipConflictError
-				if errors.As(err, &ownershipErr) {
+				if errors.As(err, &ownershipErr) || errors.Is(err, controllerack.ErrRackCacheStale) {
 					if statusErr := finishRackReconcile(key.InventoryName, &key, observed, result); statusErr != nil {
 						return errors.Join(err, statusErr)
 					}

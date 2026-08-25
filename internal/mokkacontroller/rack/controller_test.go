@@ -934,6 +934,92 @@ func TestReconcileDeletionFinalizersAndManualRackDeletion(t *testing.T) {
 	require.NotContains(t, finished.Finalizers, InventoryFinalizer)
 }
 
+func TestReconcileInventoryDeletionRetiresLiveCacheMissingRackBeforeFinalizer(t *testing.T) {
+	ctx := context.Background()
+	inventory := testInventory("inventory", "inventory-uid", "p", 1)
+	inventory.Finalizers = []string{InventoryFinalizer}
+	now := metav1.Now()
+	inventory.DeletionTimestamp = &now
+	h := newHarness(t, []runtime.Object{inventory}, nil)
+
+	liveRack := newRack(inventory, "cache-missing", mokkav1alpha1.SGPURackSpec{
+		InventoryRef: mokkav1alpha1.SGPURackInventoryReference{Name: inventory.Name, UID: inventory.UID},
+		Identity:     mokkav1alpha1.SGPURackIdentity{RackGroup: "group"},
+		Nodes: []mokkav1alpha1.SGPURackNode{{
+			Index:   0,
+			NodeRef: &mokkav1alpha1.SGPUNodeReference{Name: "node", UID: "node-uid"},
+		}},
+	})
+	liveRack, err := h.mokka.MokkaV1alpha1().SGPURacks().Create(
+		ctx, liveRack, metav1.CreateOptions{FieldManager: RackFieldManager},
+	)
+	require.NoError(t, err)
+
+	foreignInventory := inventory.DeepCopy()
+	foreignInventory.UID = "replacement-uid"
+	foreignRack := newRack(foreignInventory, "foreign", mokkav1alpha1.SGPURackSpec{
+		InventoryRef: mokkav1alpha1.SGPURackInventoryReference{Name: inventory.Name, UID: foreignInventory.UID},
+		Identity:     mokkav1alpha1.SGPURackIdentity{RackGroup: "group", RackIndex: 1},
+		Nodes:        []mokkav1alpha1.SGPURackNode{{Index: 0}},
+	})
+	foreignRack, err = h.mokka.MokkaV1alpha1().SGPURacks().Create(
+		ctx, foreignRack, metav1.CreateOptions{FieldManager: RackFieldManager},
+	)
+	require.NoError(t, err)
+	h.mokka.Fake.ClearActions()
+
+	result, err := h.reconcile(ctx, inventory.Name)
+	require.ErrorIs(t, err, ErrRackCacheStale)
+	require.Len(t, result.CleanupNeeded, 1)
+	require.Len(t, h.mokka.Actions(), 1)
+	liveList := h.mokka.Actions()[0].(k8stesting.ListAction)
+	require.Equal(t, InventoryNameLabel+"=inventory", liveList.GetListRestrictions().Labels.String())
+	retained, err := h.mokka.MokkaV1alpha1().SGPUInventories().Get(ctx, inventory.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, retained.Finalizers, InventoryFinalizer)
+	retiring, err := h.mokka.MokkaV1alpha1().SGPURacks().Get(ctx, liveRack.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, retiring.Finalizers, RackFinalizer)
+	require.NotNil(t, retiring.Spec.Nodes[0].NodeRef)
+
+	h.cleaned = true
+	_, err = h.reconcile(ctx, inventory.Name)
+	require.ErrorIs(t, err, ErrRackCacheStale)
+	_, err = h.mokka.MokkaV1alpha1().SGPURacks().Get(ctx, liveRack.Name, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+	retained, err = h.mokka.MokkaV1alpha1().SGPUInventories().Get(ctx, inventory.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, retained.Finalizers, InventoryFinalizer)
+
+	_, err = h.reconcile(ctx, inventory.Name)
+	require.NoError(t, err)
+	finished, err := h.mokka.MokkaV1alpha1().SGPUInventories().Get(ctx, inventory.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotContains(t, finished.Finalizers, InventoryFinalizer)
+	untouched, err := h.mokka.MokkaV1alpha1().SGPURacks().Get(ctx, foreignRack.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, untouched.Finalizers, RackFinalizer)
+}
+
+func TestReconcileInventoryDeletionPropagatesLiveListError(t *testing.T) {
+	ctx := context.Background()
+	inventory := testInventory("inventory", "inventory-uid", "p", 1)
+	inventory.Finalizers = []string{InventoryFinalizer}
+	now := metav1.Now()
+	inventory.DeletionTimestamp = &now
+	h := newHarness(t, []runtime.Object{inventory}, nil)
+
+	wantErr := errors.New("list failed")
+	h.mokka.PrependReactor("list", "sgpuracks", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, wantErr
+	})
+	_, err := h.reconcile(ctx, inventory.Name)
+	require.ErrorIs(t, err, wantErr)
+	retained, getErr := h.mokka.MokkaV1alpha1().SGPUInventories().Get(ctx, inventory.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	require.Contains(t, retained.Finalizers, InventoryFinalizer)
+}
+
 func TestInformerIndexesExposeOnlyDirectDependents(t *testing.T) {
 	inventoryIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, InventoryIndexers())
 	inventory := testInventory("inventory", "inventory-uid", "p", 1)
