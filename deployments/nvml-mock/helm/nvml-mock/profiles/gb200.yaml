@@ -492,6 +492,14 @@ infiniband:
   guid_prefix: "9b88c2:0300:ab"
   node_desc_template: "{node_name} mlx5_{idx}"
 
+  # Node extended resource the Network Operator's rdma-shared-dev-plugin
+  # advertises on a real IB node; the node agent's rdmaplugin simulator stands
+  # in for it. hca_max mirrors that plugin's rdmaHcaMax pod-sharing limit, not
+  # the HCA count. Not a sysfs surface — the renderer ignores it.
+  rdma_resource:
+    name: "rdma/ib"
+    hca_max: 64
+
 # =============================================================================
 # PCIe topology - GB200, 2 Grace CPUs -> 2 NUMA nodes, 2 GPUs each.
 # Consumed by `render-pci-sysfs` to materialize a fake /sys/bus/pci tree

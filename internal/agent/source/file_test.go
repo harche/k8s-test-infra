@@ -11,6 +11,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
+
+	"github.com/NVIDIA/k8s-test-infra/internal/agent"
+	ibconfig "github.com/NVIDIA/k8s-test-infra/pkg/network/mockib/config"
 )
 
 func TestCompileState_AllSKUs(t *testing.T) {
@@ -47,6 +51,70 @@ func TestCompileState_FabricState(t *testing.T) {
 
 	require.True(t, state.Fabric.Enabled, "gb200 fabric should be enabled")
 	require.Positive(t, state.Fabric.LinksPerGPU)
+}
+
+func TestCompileState_RDMAResource(t *testing.T) {
+	tests := map[string]struct {
+		yaml string
+		want agent.RDMAResource
+	}{
+		"declared": {
+			yaml: `
+infiniband:
+  enabled: true
+  rdma_resource:
+    name: "rdma/ib"
+    hca_max: 64
+`,
+			want: agent.RDMAResource{Name: "rdma/ib", Count: 64},
+		},
+		"ib without the block": {
+			yaml: "infiniband:\n  enabled: true\n",
+			want: agent.RDMAResource{},
+		},
+		"no infiniband block": {
+			yaml: "version: \"1.0\"\n",
+			want: agent.RDMAResource{},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			state, err := compileState([]byte(tc.yaml))
+			require.NoError(t, err)
+			require.Equal(t, tc.want, state.Network.RDMAResource)
+		})
+	}
+}
+
+// The chart profiles are what the ConfigMap carries into the agent, so an IB
+// profile that forgets the block (or misspells a key) silently stops
+// advertising rdma/ib on every node running it.
+func TestCompileState_ChartProfilesDeclareRDMAResource(t *testing.T) {
+	profiles, err := filepath.Glob("../../../deployments/nvml-mock/helm/nvml-mock/profiles/*.yaml")
+	require.NoError(t, err)
+	require.NotEmpty(t, profiles, "no chart profiles found")
+
+	for _, path := range profiles {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			state, err := compileState(data)
+			require.NoError(t, err)
+
+			var profile ibconfig.Profile
+			require.NoError(t, yaml.Unmarshal(data, &profile))
+			if !profile.Infiniband.Enabled {
+				require.Empty(t, state.Network.RDMAResource.Name,
+					"non-IB profile advertises an RDMA resource")
+				return
+			}
+
+			res := state.Network.RDMAResource
+			require.Equal(t, "rdma/ib", res.Name)
+			require.Positive(t, res.Count)
+		})
+	}
 }
 
 func TestFileSource_EmitsInitialState(t *testing.T) {

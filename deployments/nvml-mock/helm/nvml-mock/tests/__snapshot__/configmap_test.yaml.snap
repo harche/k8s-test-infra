@@ -447,6 +447,14 @@ should match snapshot with a100 profile:
           guid_prefix: "a288c2:0300:ab"
           node_desc_template: "{node_name} mlx5_{idx}"
 
+          # Node extended resource the Network Operator's rdma-shared-dev-plugin
+          # advertises on a real IB node; the node agent's rdmaplugin simulator stands
+          # in for it. hca_max mirrors that plugin's rdmaHcaMax pod-sharing limit, not
+          # the HCA count. Not a sysfs surface — the renderer ignores it.
+          rdma_resource:
+            name: "rdma/ib"
+            hca_max: 64
+
         # =============================================================================
         # PCIe topology - 2 NUMA nodes (dual EPYC), 4 GPUs each.
         # Consumed by `render-pci-sysfs` to materialize a fake /sys/bus/pci tree
@@ -925,6 +933,14 @@ should match snapshot with b200 profile:
           hcas_per_gpu: 1
           guid_prefix: "b288c2:0300:ab"
           node_desc_template: "{node_name} mlx5_{idx}"
+
+          # Node extended resource the Network Operator's rdma-shared-dev-plugin
+          # advertises on a real IB node; the node agent's rdmaplugin simulator stands
+          # in for it. hca_max mirrors that plugin's rdmaHcaMax pod-sharing limit, not
+          # the HCA count. Not a sysfs surface — the renderer ignores it.
+          rdma_resource:
+            name: "rdma/ib"
+            hca_max: 64
 
         # =============================================================================
         # PCIe topology - B200, 2 NUMA nodes, 4 GPUs each.
@@ -1462,6 +1478,17 @@ should match snapshot with default gb300 profile:
           guid_prefix: "9b88c2:0301:cd"
           node_desc_template: "{node_name} mlx5_{idx}"
 
+          # Not a sysfs surface — the renderer ignores it. On a real IB node the
+          # Network Operator's rdma-shared-dev-plugin advertises this extended
+          # resource; the node agent's rdmaplugin simulator stands in for it and
+          # publishes the same node capacity, reproducing the node's scheduling
+          # surface. hca_max is that plugin's rdmaHcaMax — how many pods may share the
+          # node's HCAs — and is unrelated to hcas_per_gpu above: a 4-HCA GB300
+          # compute tray still reports rdma/ib = 64.
+          rdma_resource:
+            name: "rdma/ib"
+            hca_max: 64
+
         # =============================================================================
         # PCIe topology (consumed by render-pci-sysfs to materialize
         # /sys/bus/pci/devices/<bdf> -> ../../../devices/pciDDDD:BB/<bdf> symlinks
@@ -1988,6 +2015,14 @@ should match snapshot with gb200 profile:
           guid_prefix: "9b88c2:0300:ab"
           node_desc_template: "{node_name} mlx5_{idx}"
 
+          # Node extended resource the Network Operator's rdma-shared-dev-plugin
+          # advertises on a real IB node; the node agent's rdmaplugin simulator stands
+          # in for it. hca_max mirrors that plugin's rdmaHcaMax pod-sharing limit, not
+          # the HCA count. Not a sysfs surface — the renderer ignores it.
+          rdma_resource:
+            name: "rdma/ib"
+            hca_max: 64
+
         # =============================================================================
         # PCIe topology - GB200, 2 Grace CPUs -> 2 NUMA nodes, 2 GPUs each.
         # Consumed by `render-pci-sysfs` to materialize a fake /sys/bus/pci tree
@@ -2478,6 +2513,14 @@ should match snapshot with h100 profile:
           hcas_per_gpu: 1                   # total HCAs = gpu.count * hcas_per_gpu
           guid_prefix: "a088c2:0300:ab"     # last byte = HCA index
           node_desc_template: "{node_name} mlx5_{idx}"
+
+          # Node extended resource the Network Operator's rdma-shared-dev-plugin
+          # advertises on a real IB node; the node agent's rdmaplugin simulator stands
+          # in for it. hca_max mirrors that plugin's rdmaHcaMax pod-sharing limit, not
+          # the HCA count. Not a sysfs surface — the renderer ignores it.
+          rdma_resource:
+            name: "rdma/ib"
+            hca_max: 64
 
         # =============================================================================
         # PCIe topology - HGX H100, 2 NUMA nodes, 4 GPUs each.

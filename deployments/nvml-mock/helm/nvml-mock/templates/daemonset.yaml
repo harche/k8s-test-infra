@@ -221,6 +221,14 @@ spec:
             - --log-format={{ .Values.nodeAgent.logging.format }}
             - --shutdown-timeout={{ .Values.nodeAgent.shutdownTimeout }}
           env:
+            # Names the node the agent publishes Kubernetes-level surfaces to
+            # (the rdmaplugin simulator's extended resource). Without it the
+            # compiled State carries no node identity and those simulators have
+            # nothing to patch.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: GPU_COUNT
               value: "{{ include "nvml-mock.gpuCount" . }}"
             - name: DRIVER_VERSION

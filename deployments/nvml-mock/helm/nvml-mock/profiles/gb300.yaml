@@ -495,6 +495,17 @@ infiniband:
   guid_prefix: "9b88c2:0301:cd"
   node_desc_template: "{node_name} mlx5_{idx}"
 
+  # Not a sysfs surface — the renderer ignores it. On a real IB node the
+  # Network Operator's rdma-shared-dev-plugin advertises this extended
+  # resource; the node agent's rdmaplugin simulator stands in for it and
+  # publishes the same node capacity, reproducing the node's scheduling
+  # surface. hca_max is that plugin's rdmaHcaMax — how many pods may share the
+  # node's HCAs — and is unrelated to hcas_per_gpu above: a 4-HCA GB300
+  # compute tray still reports rdma/ib = 64.
+  rdma_resource:
+    name: "rdma/ib"
+    hca_max: 64
+
 # =============================================================================
 # PCIe topology (consumed by render-pci-sysfs to materialize
 # /sys/bus/pci/devices/<bdf> -> ../../../devices/pciDDDD:BB/<bdf> symlinks

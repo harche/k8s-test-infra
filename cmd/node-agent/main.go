@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,12 +16,15 @@ import (
 
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/NVIDIA/k8s-test-infra/internal/agent"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/gpudriver"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/health"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/host"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/pcibus"
+	"github.com/NVIDIA/k8s-test-infra/internal/agent/rdmaplugin"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/source"
 	"github.com/NVIDIA/k8s-test-infra/internal/logging"
 )
@@ -107,7 +111,7 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 	healthSrv := health.NewServer(cmd.String("health-addr"), log, shutdownTimeout)
 
 	a := agent.New(agent.Config{
-		Simulators:      []agent.Simulator{gpudriver.New(), pcibus.New()},
+		Simulators:      simulators(log),
 		Source:          source.NewFileSource(configPath, log),
 		Host:            host.New(cmd.String("host-root")),
 		Log:             log,
@@ -121,4 +125,29 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 	g.Go(func() error { return healthSrv.Run(gctx) })
 	g.Go(func() error { return a.Run(gctx) })
 	return g.Wait()
+}
+
+// simulators returns the enabled simulators. Those that publish to the
+// Kubernetes API are registered only when the agent has a client for it, so
+// running the binary outside a cluster stays possible: the surfaces it cannot
+// reach are absent from /readyz rather than permanently unready.
+func simulators(log *slog.Logger) []agent.Simulator {
+	nodes, err := nodeClient()
+	if err != nil {
+		log.Warn("no Kubernetes client; node-level surfaces will not be published", "err", err)
+		return []agent.Simulator{gpudriver.New(), pcibus.New()}
+	}
+	return []agent.Simulator{gpudriver.New(), pcibus.New(), rdmaplugin.New(nodes, log)}
+}
+
+func nodeClient() (rdmaplugin.NodeClient, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("in-cluster config: %w", err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build clientset: %w", err)
+	}
+	return cs.CoreV1().Nodes(), nil
 }

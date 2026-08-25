@@ -19,7 +19,7 @@ should match snapshot with all overrides:
       template:
         metadata:
           annotations:
-            checksum/config: fccb5cf9ce1dc2d717ff75f1a57dac8f1581c95d6f8fc5c4138493a21edeba58
+            checksum/config: 7738e6ca34ec9dbd55739dc3c91807dc664b210b6044050282cf676ea6411a77
           labels:
             app.kubernetes.io/component: daemon
             app.kubernetes.io/instance: custom
@@ -117,6 +117,10 @@ should match snapshot with all overrides:
                 - --log-format=json
                 - --shutdown-timeout=30s
               env:
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
                 - name: GPU_COUNT
                   value: "2"
                 - name: DRIVER_VERSION
@@ -210,7 +214,7 @@ should match snapshot with b200 profile:
       template:
         metadata:
           annotations:
-            checksum/config: 86035ed7a00d2e6cdd7c437cf85f5a41211f1ea2fb8a369cc5066b4bd8ec1433
+            checksum/config: d539a3547b66d52817a5345775fc54352a9bf4b976514d6e392937925cc6f2b0
           labels:
             app.kubernetes.io/component: daemon
             app.kubernetes.io/instance: RELEASE-NAME
@@ -295,6 +299,10 @@ should match snapshot with b200 profile:
                 - --log-format=json
                 - --shutdown-timeout=30s
               env:
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
                 - name: GPU_COUNT
                   value: "4"
                 - name: DRIVER_VERSION
@@ -380,7 +388,7 @@ should match snapshot with default values:
       template:
         metadata:
           annotations:
-            checksum/config: e320e5ab85f89b9678ceb8681b040d2cfd84ad50190566425a8772fe4c916221
+            checksum/config: 7a4a929f78156ba431754986043065a549d70368774e9a0f2fbfbc5b3ceb4f55
           labels:
             app.kubernetes.io/component: daemon
             app.kubernetes.io/instance: RELEASE-NAME
@@ -471,6 +479,10 @@ should match snapshot with default values:
                 - --log-format=json
                 - --shutdown-timeout=30s
               env:
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
                 - name: GPU_COUNT
                   value: "4"
                 - name: DRIVER_VERSION

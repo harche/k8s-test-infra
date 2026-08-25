@@ -66,6 +66,18 @@ tests:
             resources: ["nodes"]
             verbs: ["get", "patch"]
 
+  # The node agent's rdmaplugin simulator patches the profile's RDMA extended
+  # resource into .status.capacity, which the nodes grant above does not cover.
+  - it: should grant patch on the node status subresource
+    documentIndex: 1
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["nodes/status"]
+            verbs: ["patch"]
+
   - it: should include standard labels on ClusterRole
     documentIndex: 1
     asserts:

@@ -812,6 +812,19 @@ tests:
           path: spec.template.spec.containers[1].command
           content: --shutdown-timeout=30s
 
+  # The rdmaplugin simulator patches this node's status to advertise rdma/ib.
+  # Without NODE_NAME the compiled State has no node identity, so the resource
+  # is never advertised and pods requesting it stay Pending.
+  - it: node-agent should know which node it runs on
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+
   - it: should honour node-agent logging and timeout overrides
     set:
       nodeAgent:
