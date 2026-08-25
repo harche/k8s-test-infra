@@ -91,8 +91,9 @@ selector.
 {{- end }}
 
 {{/*
-The control plane mutates cluster-scoped state, so its required
-ClusterRoleBinding also serves as the fixed, Helm-owned singleton guard.
+The control plane mutates cluster-scoped state, so its required cluster-scoped
+RBAC resources use a fixed identity. The ClusterRoleBinding also serves as the
+Helm-owned singleton guard.
 */}}
 {{- define "nvml-mock.controlPlaneSingletonName" -}}
 mokka-control-plane.mokka.nvidia.com

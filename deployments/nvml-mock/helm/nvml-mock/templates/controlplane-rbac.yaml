@@ -19,7 +19,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "nvml-mock.controlPlaneName" . }}
+  name: {{ $singletonName }}
   labels:
     {{- include "nvml-mock.controlPlaneLabels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
@@ -50,7 +50,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "nvml-mock.controlPlaneName" . }}
+  name: {{ $singletonName }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "nvml-mock.controlPlaneName" . }}
