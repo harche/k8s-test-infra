@@ -77,6 +77,10 @@ use "Option B: Build from source" in the quick start sections below.
 **Cluster requirements:**
 - Privileged pods must be allowed (nvml-mock DaemonSet uses `privileged: true` for `mknod`)
 - For DRA: Kubernetes 1.32+ with `DynamicResourceAllocation` feature gate enabled
+- The base chart supports Kubernetes 1.28+. Enabling `controlPlane.enabled`
+  requires Kubernetes 1.30+ for the stable `ValidatingAdmissionPolicy` that
+  reserves SGPURack creates and updates for this release's Mokka controller;
+  deletes and status updates remain unaffected.
 
 ## Quick Start: Device Plugin on KIND
 
