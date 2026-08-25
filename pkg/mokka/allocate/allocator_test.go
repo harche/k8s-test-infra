@@ -164,6 +164,27 @@ func TestAllocatorPlansBindingReleases(t *testing.T) {
 	require.Equal(t, []Node{nodes[1], nodes[2], nodes[4]}, plan.Pending)
 }
 
+func TestAllocatorExcludesTerminatingNodes(t *testing.T) {
+	group := Group{Key: groupKey("inventory-a", "compute"), Racks: 1, NodesPerRack: 2}
+	bound := node("bound", "bound-uid", 1, eligibleLabels())
+	bound.Terminating = true
+	unbound := node("unbound", "unbound-uid", 2, eligibleLabels())
+	unbound.Terminating = true
+	binding := binding(group.Key, 0, 0, bound.Name, bound.UID)
+
+	plan, err := Allocate(Input{
+		Groups:   []Group{group},
+		Nodes:    []Node{bound, unbound},
+		Bindings: []Binding{binding},
+	})
+
+	require.NoError(t, err)
+	require.Empty(t, plan.Retained)
+	require.Equal(t, []Release{{Binding: binding, Reason: ReleaseNodeIneligible}}, plan.Released)
+	require.Empty(t, plan.Assigned)
+	require.Empty(t, plan.Pending)
+}
+
 func TestAllocatorHandlesSameNameNewUIDAsAReplacement(t *testing.T) {
 	group := Group{Key: groupKey("inventory-a", "compute"), Racks: 1, NodesPerRack: 1}
 	oldBinding := binding(group.Key, 0, 0, "same-name", "old-uid")

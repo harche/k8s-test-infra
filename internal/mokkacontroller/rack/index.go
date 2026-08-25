@@ -271,7 +271,9 @@ func (c *ListerCache) AllocationNodes() ([]allocate.Node, error) {
 	for _, node := range nodes {
 		allocationNodes = append(allocationNodes, allocate.Node{
 			Name: node.Name, UID: node.UID,
-			CreationTimestamp: node.CreationTimestamp.Time, Labels: node.Labels,
+			CreationTimestamp: node.CreationTimestamp.Time,
+			Terminating:       node.DeletionTimestamp != nil,
+			Labels:            node.Labels,
 		})
 	}
 	return allocationNodes, nil

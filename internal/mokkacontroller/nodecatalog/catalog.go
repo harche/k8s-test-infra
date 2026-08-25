@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
@@ -87,7 +86,9 @@ func (c *Catalog) Upsert(node *corev1.Node) {
 	}
 	allocation := allocate.Node{
 		Name: node.Name, UID: node.UID,
-		CreationTimestamp: node.CreationTimestamp.Time, Labels: node.Labels,
+		CreationTimestamp: node.CreationTimestamp.Time,
+		Terminating:       node.DeletionTimestamp != nil,
+		Labels:            node.Labels,
 	}
 	record := &Record{
 		node:       node,
@@ -98,7 +99,7 @@ func (c *Catalog) Upsert(node *corev1.Node) {
 	defer c.mu.Unlock()
 	allocationChanged := true
 	if previous := c.byName[node.Name]; previous != nil && previous.node.UID == node.UID {
-		allocationChanged = !allocationNodeEqual(previous, node, allocation)
+		allocationChanged = !allocationNodeEqual(previous, allocation)
 	}
 	if previous := c.byName[node.Name]; previous != nil {
 		c.removeLocked(previous)
@@ -236,12 +237,12 @@ func (c *Catalog) removeLocked(record *Record) {
 	}
 }
 
-func allocationNodeEqual(previous *Record, node *corev1.Node, allocation allocate.Node) bool {
+func allocationNodeEqual(previous *Record, allocation allocate.Node) bool {
 	return previous.allocation.Name == allocation.Name &&
 		previous.allocation.UID == allocation.UID &&
 		previous.allocation.CreationTimestamp.Equal(allocation.CreationTimestamp) &&
-		allocationLabelsEqual(previous.allocation.Labels, allocation.Labels) &&
-		equality.Semantic.DeepEqual(previous.node.DeletionTimestamp, node.DeletionTimestamp)
+		previous.allocation.Terminating == allocation.Terminating &&
+		allocationLabelsEqual(previous.allocation.Labels, allocation.Labels)
 }
 
 func allocationLabelsEqual(previous, current map[string]string) bool {

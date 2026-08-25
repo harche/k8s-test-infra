@@ -106,15 +106,28 @@ func TestCatalogGenerationTracksExactAllocationInputWithoutProjectionFeedback(t 
 	selectorChanged.Labels["pool"] = "green"
 	catalog.Upsert(selectorChanged)
 	require.EqualValues(t, 2, catalog.Generation())
+	selectorSnapshot := catalog.Snapshot()
 
-	replacement := selectorChanged.DeepCopy()
+	terminating := selectorChanged.DeepCopy()
+	now := metav1.Now()
+	terminating.DeletionTimestamp = &now
+	catalog.Upsert(terminating)
+	require.EqualValues(t, 3, catalog.Generation())
+	terminatingSnapshot := catalog.Snapshot()
+	require.NotSame(t, selectorSnapshot, terminatingSnapshot)
+	require.True(t, terminatingSnapshot.AllocationNodes()[0].Terminating)
+	record, found := catalog.GetByName(terminating.Name)
+	require.True(t, found)
+	require.Same(t, terminating, record.Node(), "termination must not discard the exact record needed for cleanup")
+
+	replacement := terminating.DeepCopy()
 	replacement.UID = "uid-2"
 	catalog.Upsert(replacement)
-	require.EqualValues(t, 3, catalog.Generation())
-	catalog.Delete(replacement.Name, "uid-1")
-	require.EqualValues(t, 3, catalog.Generation(), "stale deletion must not evict a replacement")
-	catalog.Delete(replacement.Name, replacement.UID)
 	require.EqualValues(t, 4, catalog.Generation())
+	catalog.Delete(replacement.Name, "uid-1")
+	require.EqualValues(t, 4, catalog.Generation(), "stale deletion must not evict a replacement")
+	catalog.Delete(replacement.Name, replacement.UID)
+	require.EqualValues(t, 5, catalog.Generation())
 }
 
 func BenchmarkCatalogSteadySnapshot100K(b *testing.B) {

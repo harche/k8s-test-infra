@@ -120,7 +120,7 @@ func validateGroup(group Group) error {
 }
 
 func eligible(node Node) bool {
-	return node.Labels[EligibleNodeLabel] == "true"
+	return !node.Terminating && node.Labels[EligibleNodeLabel] == "true"
 }
 
 func compareGroupKey(a, b GroupKey) int {

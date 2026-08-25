@@ -101,6 +101,13 @@ func TestProjectionTargetAllowedRequiresOwnedDesiredEligibleBinding(t *testing.T
 			},
 		},
 		{
+			name: "terminating Node",
+			mutate: func(_ *mokkav1alpha1.SGPURack, node *corev1.Node) {
+				now := metav1.Now()
+				node.DeletionTimestamp = &now
+			},
+		},
+		{
 			name: "selector-mismatched Node",
 			mutate: func(_ *mokkav1alpha1.SGPURack, node *corev1.Node) {
 				node.Labels["pool"] = "other"

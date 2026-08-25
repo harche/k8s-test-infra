@@ -41,6 +41,7 @@ type Node struct {
 	Name              string
 	UID               types.UID
 	CreationTimestamp time.Time
+	Terminating       bool
 	Labels            map[string]string
 }
 

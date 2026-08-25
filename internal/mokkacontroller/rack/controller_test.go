@@ -482,6 +482,30 @@ func TestReconcileProjectedLabelSelectorRetainsBindingWithoutWrites(t *testing.T
 	require.Equal(t, node.UID, retained.Spec.Nodes[0].NodeRef.UID)
 }
 
+func TestReconcileReleasesTerminatingNodeAsIneligible(t *testing.T) {
+	ctx := context.Background()
+	profile := testProfile("p", "profile-uid", 1, 1, 1)
+	inventory := testInventory("inventory", "inventory-uid", "p", 1)
+	node := testNode("node", "node-uid", 1, map[string]string{"pool": "gpu"})
+	h := newHarness(t, []runtime.Object{profile, inventory}, []*corev1.Node{node})
+	_, err := h.reconcile(ctx, inventory.Name)
+	require.NoError(t, err)
+	h.sync(t)
+
+	now := metav1.Now()
+	h.nodes[0].DeletionTimestamp = &now
+	h.sync(t)
+	result, err := h.reconcile(ctx, inventory.Name)
+
+	require.NoError(t, err)
+	require.Empty(t, result.Allocation.Retained)
+	require.Empty(t, result.Allocation.Assigned)
+	require.Len(t, result.Allocation.Released, 1)
+	require.Equal(t, allocate.ReleaseNodeIneligible, result.Allocation.Released[0].Reason)
+	require.Len(t, result.CleanupNeeded, 1)
+	require.Equal(t, CleanupNodeIneligible, result.CleanupNeeded[0].Reason)
+}
+
 func TestReconcileUsesCurrentInventoryOverStaleListSnapshot(t *testing.T) {
 	ctx := context.Background()
 	profile := testProfile("p", "profile-uid", 1, 1, 1)
@@ -989,7 +1013,9 @@ func (c *nodeOverrideCache) AllocationNodes() ([]allocate.Node, error) {
 	for _, node := range c.nodes {
 		nodes = append(nodes, allocate.Node{
 			Name: node.Name, UID: node.UID,
-			CreationTimestamp: node.CreationTimestamp.Time, Labels: node.Labels,
+			CreationTimestamp: node.CreationTimestamp.Time,
+			Terminating:       node.DeletionTimestamp != nil,
+			Labels:            node.Labels,
 		})
 	}
 	return nodes, nil

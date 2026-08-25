@@ -998,6 +998,24 @@ func TestNodeSpecUpdateDoesNotRouteAllocationWork(t *testing.T) {
 	require.Empty(t, drainQueue(queues.status))
 }
 
+func TestTerminatingNodeUpdateRoutesAllocationWork(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	registry := newPlacementRegistry()
+	registry.replace(testInventory())
+	router := newEventRouter(inventories, racks, registry, queues)
+
+	oldNode := testNode()
+	terminating := oldNode.DeepCopy()
+	now := metav1.Now()
+	terminating.DeletionTimestamp = &now
+	router.nodeUpdate(oldNode, terminating)
+
+	require.Equal(t, []allocate.GroupKey{testGroupKey()}, drainQueue(queues.groups))
+}
+
 func TestSingleNodeEventDoesNotListFromAPI(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
