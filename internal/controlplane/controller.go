@@ -183,7 +183,14 @@ func runLeaderElection(
 	electionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	work := newLeaderWork()
-	draining := &drainingLock{Interface: lock, workDone: work.done, stopWork: cancel}
+	stopWork := cancel
+	if readiness != nil {
+		stopWork = func() {
+			cancel()
+			readiness.stop()
+		}
+	}
+	draining := &drainingLock{Interface: lock, workDone: work.done, stopWork: stopWork}
 	electionConfig := newLeaderElectionConfig(
 		config, draining, work.onStartedLeading(run, cancel), readiness,
 	)
@@ -191,7 +198,7 @@ func runLeaderElection(
 	if err != nil {
 		return fmt.Errorf("configure leader election: %w", err)
 	}
-	elector.Run(electionCtx)
+	elector.Run(context.WithValue(electionCtx, leaderElectionContextKey{}, true))
 	cancel()
 	if !work.finishElection() {
 		return nil
@@ -317,16 +324,36 @@ type drainingLock struct {
 	stopWork context.CancelFunc
 }
 
+type leaderElectionContextKey struct{}
+
+func (l *drainingLock) Get(ctx context.Context) (*rl.LeaderElectionRecord, []byte, error) {
+	// client-go starts release with a fresh context, so drain before its
+	// potentially slow GET instead of waiting for the final Lease update.
+	if ctx.Value(leaderElectionContextKey{}) == nil {
+		if err := l.stopAndWait(ctx); err != nil {
+			return nil, nil, err
+		}
+	}
+	return l.Interface.Get(ctx)
+}
+
 func (l *drainingLock) Update(ctx context.Context, record rl.LeaderElectionRecord) error {
 	if record.HolderIdentity == "" {
-		if l.stopWork != nil {
-			l.stopWork()
-		}
-		select {
-		case <-l.workDone:
-		case <-ctx.Done():
-			return context.Cause(ctx)
+		if err := l.stopAndWait(ctx); err != nil {
+			return err
 		}
 	}
 	return l.Interface.Update(ctx, record)
+}
+
+func (l *drainingLock) stopAndWait(ctx context.Context) error {
+	if l.stopWork != nil {
+		l.stopWork()
+	}
+	select {
+	case <-l.workDone:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
 }

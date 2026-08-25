@@ -115,6 +115,77 @@ func TestLeaderElectionDrainsWorkBeforeRelease(t *testing.T) {
 	t.Run("leader loss", func(t *testing.T) { testLeaderElectionDrain(t, true) })
 }
 
+func TestLeaderElectionStopsWorkBeforeReleaseGet(t *testing.T) {
+	config := DefaultConfig()
+	config.LeaseDuration = 2 * time.Second
+	config.RenewDeadline = 500 * time.Millisecond
+	config.RetryPeriod = 10 * time.Millisecond
+	lock := newElectionResourceLock(true)
+	lock.delayReleaseGet = true
+	lock.releaseGetStarted = make(chan struct{})
+	lock.continueReleaseGet = make(chan struct{})
+	readiness := newElectionReadiness()
+	workStarted := make(chan struct{})
+	workStopped := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		result <- runLeaderElection(ctx, config, lock, func(workCtx context.Context) error {
+			close(workStarted)
+			<-workCtx.Done()
+			close(workStopped)
+			return nil
+		}, readiness)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		lock.continueRelease()
+		select {
+		case <-runDone:
+		case <-time.After(time.Second):
+		}
+	})
+
+	requireClosed(t, workStarted, time.Second, "controller work did not start")
+	require.True(t, readiness.ready(true))
+	requireClosed(t, lock.releaseGetStarted, 2*time.Second, "leader election did not begin release GET")
+	requireAlreadyClosed(t, workStopped, "controller work remained active when the release GET began")
+	require.False(t, readiness.ready(true), "a replica that lost leadership must not remain ready")
+	select {
+	case <-result:
+		t.Fatal("leader election returned before the release GET completed")
+	default:
+	}
+
+	lock.continueRelease()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("leader election did not finish after the release GET completed")
+	}
+}
+
+func requireClosed(t *testing.T, signal <-chan struct{}, timeout time.Duration, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(timeout):
+		t.Fatal(message)
+	}
+}
+
+func requireAlreadyClosed(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	default:
+		t.Fatal(message)
+	}
+}
+
 func testLeaderElectionDrain(t *testing.T, loseLease bool) {
 	t.Helper()
 	config := DefaultConfig()
@@ -232,12 +303,17 @@ func (f *fakeResourceLock) updateCalls() int {
 }
 
 type electionResourceLock struct {
-	mu               sync.Mutex
-	record           rl.LeaderElectionRecord
-	acquired         bool
-	failAfterAcquire bool
-	released         chan struct{}
-	releaseOnce      sync.Once
+	mu                  sync.Mutex
+	record              rl.LeaderElectionRecord
+	acquired            bool
+	failAfterAcquire    bool
+	delayReleaseGet     bool
+	releaseGetStarted   chan struct{}
+	continueReleaseGet  chan struct{}
+	continueReleaseOnce sync.Once
+	releaseGetOnce      sync.Once
+	released            chan struct{}
+	releaseOnce         sync.Once
 }
 
 func newElectionResourceLock(failAfterAcquire bool) *electionResourceLock {
@@ -252,10 +328,26 @@ func newElectionResourceLock(failAfterAcquire bool) *electionResourceLock {
 	}
 }
 
-func (f *electionResourceLock) Get(context.Context) (*rl.LeaderElectionRecord, []byte, error) {
+func (f *electionResourceLock) Get(ctx context.Context) (*rl.LeaderElectionRecord, []byte, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	acquired := f.acquired
+	delayReleaseGet := f.delayReleaseGet
 	record := f.record
+	f.mu.Unlock()
+	if acquired && delayReleaseGet {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		f.releaseGetOnce.Do(func() { close(f.releaseGetStarted) })
+		select {
+		case <-f.continueReleaseGet:
+		case <-ctx.Done():
+			return nil, nil, context.Cause(ctx)
+		}
+		f.mu.Lock()
+		record = f.record
+		f.mu.Unlock()
+	}
 	return &record, nil, nil
 }
 
@@ -263,20 +355,33 @@ func (f *electionResourceLock) Create(context.Context, rl.LeaderElectionRecord) 
 	return errors.New("unexpected Lease creation")
 }
 
-func (f *electionResourceLock) Update(_ context.Context, record rl.LeaderElectionRecord) error {
+func (f *electionResourceLock) Update(ctx context.Context, record rl.LeaderElectionRecord) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if record.HolderIdentity == "" {
 		f.record = record
 		f.releaseOnce.Do(func() { close(f.released) })
+		f.mu.Unlock()
 		return nil
 	}
 	if f.acquired && f.failAfterAcquire {
+		delayReleaseGet := f.delayReleaseGet
+		f.mu.Unlock()
+		if delayReleaseGet {
+			<-ctx.Done()
+			return context.Cause(ctx)
+		}
 		return errors.New("lost Lease renewal")
 	}
 	f.acquired = true
 	f.record = record
+	f.mu.Unlock()
 	return nil
+}
+
+func (f *electionResourceLock) continueRelease() {
+	if f.continueReleaseGet != nil {
+		f.continueReleaseOnce.Do(func() { close(f.continueReleaseGet) })
+	}
 }
 
 func (f *electionResourceLock) RecordEvent(string) {}
