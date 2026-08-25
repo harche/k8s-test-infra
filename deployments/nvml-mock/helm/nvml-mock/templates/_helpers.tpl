@@ -87,7 +87,9 @@ fullname so its Deployment/Service cannot be adopted by the DaemonSet's
 selector.
 */}}
 {{- define "nvml-mock.controlPlaneName" -}}
-{{- printf "%s-control-plane" (include "nvml-mock.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- $suffix := "-control-plane" -}}
+{{- $baseLength := sub 63 (len $suffix) | int -}}
+{{- printf "%s%s" ((include "nvml-mock.fullname" .) | trunc $baseLength | trimSuffix "-") $suffix }}
 {{- end }}
 
 {{/*
