@@ -546,6 +546,7 @@ func installAcceptanceAPIReactors(t *testing.T, client *mokkafake.Clientset) {
 		if apierrors.IsNotFound(err) {
 			desired.UID = types.UID(fmt.Sprintf("uid-%s-%d", desired.Name, nextRackUID.Add(1)))
 			desired.ResourceVersion = "1"
+			setAcceptanceRackManagedFields(desired)
 			err = client.Tracker().Create(resource, desired, "")
 			return true, desired, err
 		}
@@ -564,6 +565,7 @@ func installAcceptanceAPIReactors(t *testing.T, client *mokkafake.Clientset) {
 		updated.Finalizers = desired.Finalizers
 		updated.OwnerReferences = desired.OwnerReferences
 		updated.ResourceVersion += "a"
+		setAcceptanceRackManagedFields(updated)
 		err = client.Tracker().Update(resource, updated, "")
 		return true, updated, err
 	})
@@ -619,12 +621,18 @@ func installAcceptanceRackCreateReactor(
 		}
 		desired.UID = types.UID(fmt.Sprintf("uid-%s-%d", desired.Name, nextRackUID.Add(1)))
 		desired.ResourceVersion = "1"
-		desired.ManagedFields = []metav1.ManagedFieldsEntry{{
-			Manager: controllerack.RackFieldManager, Operation: metav1.ManagedFieldsOperationUpdate,
-		}}
+		setAcceptanceRackManagedFields(desired)
 		err := client.Tracker().Create(resource, desired, "")
 		return true, desired, err
 	})
+}
+
+func setAcceptanceRackManagedFields(rack *mokkav1alpha1.SGPURack) {
+	rack.ManagedFields = []metav1.ManagedFieldsEntry{{
+		Manager: controllerack.RackFieldManager, Operation: metav1.ManagedFieldsOperationApply,
+		APIVersion: mokkav1alpha1.SchemeGroupVersion.String(), FieldsType: "FieldsV1",
+		FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{}}`)},
+	}}
 }
 
 func acceptanceProfile(nodesPerRack int32) *mokkav1alpha1.SGPURackProfile {
