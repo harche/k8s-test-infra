@@ -161,11 +161,11 @@ func allocationInputRevision(
 	if err != nil {
 		return allocate.Input{}, fmt.Errorf("list inventories from cache: %w", err)
 	}
-	groups, inventoriesByUID, err := allocationGroups(cache, inventories, admission, revision)
+	groups, err := allocationGroups(cache, inventories, admission, revision)
 	if err != nil {
 		return allocate.Input{}, err
 	}
-	bindings, err := allocationBindings(cache, inventoriesByUID)
+	bindings, err := allocationBindings(cache, inventories)
 	if err != nil {
 		return allocate.Input{}, err
 	}
@@ -181,32 +181,27 @@ func allocationGroups(
 	inventories []*mokkav1alpha1.SGPUInventory,
 	admission *CapacityAdmission,
 	revision capacityRevision,
-) ([]allocate.Group, map[types.UID]*mokkav1alpha1.SGPUInventory, error) {
+) ([]allocate.Group, error) {
 	groups := make([]allocate.Group, 0)
-	inventoriesByUID := make(
-		map[types.UID]*mokkav1alpha1.SGPUInventory,
-		min(len(inventories), int(MaxInventoryNodes)),
-	)
 	for _, inventory := range inventories {
 		resolved, err := materializedInventoryGroups(cache, inventory)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if len(resolved) == 0 {
 			continue
 		}
 		capacity, err := capacityForResolvedGroups(resolved)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		admitted, err := admission.admits(revision, inventory, capacity)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if !admitted {
 			continue
 		}
-		inventoriesByUID[inventory.UID] = inventory
 		for _, group := range resolved {
 			var selector *metav1.LabelSelector
 			if group.group.Placement != nil {
@@ -218,16 +213,25 @@ func allocationGroups(
 			})
 		}
 	}
-	return groups, inventoriesByUID, nil
+	return groups, nil
 }
 
 func allocationBindings(
 	cache Cache,
-	inventoriesByUID map[types.UID]*mokkav1alpha1.SGPUInventory,
+	inventories []*mokkav1alpha1.SGPUInventory,
 ) ([]allocate.Binding, error) {
 	racks, err := cache.Racks()
 	if err != nil {
 		return nil, fmt.Errorf("list racks from cache: %w", err)
+	}
+	inventoriesByUID := make(
+		map[types.UID]*mokkav1alpha1.SGPUInventory,
+		min(len(inventories), int(MaxInventoryNodes)),
+	)
+	for _, inventory := range inventories {
+		if inventory != nil {
+			inventoriesByUID[inventory.UID] = inventory
+		}
 	}
 	bindings := make([]allocate.Binding, 0)
 	for _, rack := range racks {

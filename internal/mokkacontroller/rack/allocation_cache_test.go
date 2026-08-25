@@ -175,6 +175,63 @@ func TestAllocationCacheRejectsGenerationChangedDuringComputation(t *testing.T) 
 	require.EqualValues(t, 2, planner.Stats().Computations)
 }
 
+func TestAllocationInputPreservedBindingsOccupyNodesUntilInventoryRecovers(t *testing.T) {
+	preservedProfile := testProfile("preserved-profile", "preserved-profile-uid", 1, 1, 1)
+	contenderProfile := testProfile("contender-profile", "contender-profile-uid", 1, 1, 1)
+	preserved := testInventory("preserved", "preserved-uid", preservedProfile.Name, 1)
+	contender := testInventory("contender", "contender-uid", contenderProfile.Name, 1)
+	node := allocate.Node{
+		Name: "node", UID: "node-uid",
+		Labels: map[string]string{allocate.EligibleNodeLabel: "true", "pool": "gpu"},
+	}
+	preservedKey := allocate.GroupKey{
+		InventoryName: preserved.Name, InventoryUID: preserved.UID, RackGroup: "group",
+	}
+	preservedBinding := allocate.Binding{
+		Coordinate: allocate.Coordinate{Group: preservedKey},
+		Node:       allocate.NodeReference{Name: node.Name, UID: node.UID},
+	}
+	source := &mutableAllocationSource{
+		inventories: []*mokkav1alpha1.SGPUInventory{preserved, contender},
+		profiles: map[string]*mokkav1alpha1.SGPURackProfile{
+			contenderProfile.Name: contenderProfile,
+		},
+		racks: []*mokkav1alpha1.SGPURack{
+			allocationRack(preserved, preservedKey, "rack-uid", &mokkav1alpha1.SGPUNodeReference{
+				Name: node.Name, UID: node.UID,
+			}),
+		},
+		nodes: []allocate.Node{node},
+	}
+
+	unresolvedInput, err := allocationInput(source)
+	require.NoError(t, err)
+	require.Len(t, unresolvedInput.Groups, 1)
+	require.Equal(t, contender.Name, unresolvedInput.Groups[0].Key.InventoryName)
+	unresolvedPlan, err := allocate.Allocate(unresolvedInput)
+	require.NoError(t, err)
+	require.Empty(t, unresolvedPlan.Assigned, "a preserved binding must keep its Node unavailable")
+	require.Equal(t, []allocate.Binding{preservedBinding}, unresolvedInput.Bindings)
+	require.Equal(t, []allocate.Release{{
+		Binding: preservedBinding, Reason: allocate.ReleaseGroupRemoved,
+	}}, unresolvedPlan.Released)
+	require.Equal(t, []allocate.Node{node}, unresolvedPlan.Pending)
+
+	source.mu.Lock()
+	source.profiles[preservedProfile.Name] = preservedProfile
+	source.mu.Unlock()
+	recoveredInput, err := allocationInput(source)
+	require.NoError(t, err)
+	require.Len(t, recoveredInput.Groups, 2)
+	recoveredPlan, err := allocate.Allocate(recoveredInput)
+	require.NoError(t, err)
+	require.Equal(t, []allocate.Binding{preservedBinding}, recoveredPlan.Retained)
+	require.Equal(t, []allocate.Binding{preservedBinding}, recoveredPlan.Bindings)
+	require.Empty(t, recoveredPlan.Assigned)
+	require.Empty(t, recoveredPlan.Released)
+	require.Empty(t, recoveredPlan.Conflicts)
+}
+
 func BenchmarkAllocationCache100KNodes64Groups(b *testing.B) {
 	const (
 		nodeCount  = 100_000
