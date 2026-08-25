@@ -66,6 +66,40 @@ func TestEventRoutingUsesBoundedDependencyKeys(t *testing.T) {
 	}, drainQueue(queues.status))
 }
 
+func TestReturningBoundNodeAddRoutesOnlyExactSlotFresh(t *testing.T) {
+	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
+	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())
+	queues := newQueues(0)
+	t.Cleanup(queues.shutdown)
+	router := newEventRouter(inventories, racks, newPlacementRegistry(), queues)
+
+	node := testNode()
+	rack := testRack(node)
+	rack.Spec.Nodes = append(rack.Spec.Nodes,
+		mokkav1alpha1.SGPURackNode{
+			Index: 1,
+			NodeRef: &mokkav1alpha1.SGPUNodeReference{
+				Name: "other-node", UID: node.UID,
+			},
+		},
+		mokkav1alpha1.SGPURackNode{
+			Index: 2,
+			NodeRef: &mokkav1alpha1.SGPUNodeReference{
+				Name: node.Name, UID: "other-node-uid",
+			},
+		},
+	)
+	require.NoError(t, racks.Add(rack))
+
+	router.nodeAdd(node)
+
+	require.Equal(t, []projectionKey{
+		{mode: projectionApply, rackName: rack.Name, nodeIndex: 0, fresh: true},
+		{mode: projectionApply, rackName: rack.Name, nodeIndex: 1},
+		{mode: projectionApply, rackName: rack.Name, nodeIndex: 2},
+	}, drainQueue(queues.projections))
+}
+
 func TestControllerOwnedFreeRackAddContinuesPendingAllocation(t *testing.T) {
 	inventories := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.InventoryIndexers())
 	racks := cache.NewIndexer(cache.MetaNamespaceKeyFunc, controllerack.Indexers())

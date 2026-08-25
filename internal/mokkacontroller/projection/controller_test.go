@@ -585,30 +585,43 @@ func TestStaleProjectionApplyDoesNotRecreateMetadataAfterCleanup(t *testing.T) {
 	require.Len(t, patcher.calls, 1, "a stale apply must not recreate metadata after cleanup")
 }
 
-func TestFreshProjectionSupersedesCleanupAcknowledgement(t *testing.T) {
+func TestReturningEligibleNodeFreshProjectionSupersedesCleanupAcknowledgement(t *testing.T) {
 	rack := testRack()
 	node := testNode("node", "node-uid")
 	setExactProjection(t, node, rack)
+	node.Labels[allocate.EligibleNodeLabel] = "true"
 	setManagedFields(node, FieldManager, []string{AssignedLabel, CliqueLabel}, []string{AssignmentAnnotation})
+	ineligible := node.DeepCopy()
+	delete(ineligible.Labels, allocate.EligibleNodeLabel)
 	cache := &fakeCache{
-		nodes: map[string]*corev1.Node{node.Name: node},
+		nodes: map[string]*corev1.Node{node.Name: ineligible},
 		racks: map[string]*mokkav1alpha1.SGPURack{rack.Name: rack},
 	}
-	patcher := &recordingPatcher{node: node}
+	patcher := &recordingPatcher{node: ineligible}
 	controller := NewController(cache, patcher)
 	cleanup := cleanupFor(rack)
+	cleanup.Reason = controllerack.CleanupNodeIneligible
 
 	_, err := controller.Cleanup(context.Background(), cleanup)
 	require.NoError(t, err)
 	require.True(t, controller.Ready(cleanup))
 	require.Len(t, patcher.calls, 1)
+	cleaned := applyNodePayload(ineligible, node.Name, patcher.calls[0].data)
+	require.NotContains(t, cleaned.Labels, AssignedLabel)
+	require.NotContains(t, cleaned.Labels, CliqueLabel)
+	require.NotContains(t, cleaned.Annotations, AssignmentAnnotation)
 
-	cache.nodes[node.Name] = testNode(node.Name, node.UID)
+	returning := cleaned.DeepCopy()
+	returning.Labels = map[string]string{allocate.EligibleNodeLabel: "true"}
+	cache.nodes[node.Name] = returning
+	patcher.node = returning
 	outcome, err := controller.ProjectFresh(context.Background(), rack.Name, 0)
 	require.NoError(t, err)
 	require.Equal(t, StateProjected, outcome.State)
 	require.False(t, controller.Ready(cleanup))
 	require.Len(t, patcher.calls, 2, "a newly observed binding must restore its projection")
+	restored := applyNodePayload(returning, node.Name, patcher.calls[1].data)
+	require.True(t, MatchesBinding(restored, rack, &rack.Spec.Nodes[0]))
 }
 
 func TestProjectionStateIsBoundedByLiveExactBindings(t *testing.T) {

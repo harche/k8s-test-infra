@@ -407,7 +407,7 @@ func (r *eventRouter) nodeAdd(object any) {
 	if !ok {
 		return
 	}
-	r.routeNode(node, nil)
+	r.routeNodeWithBindings(node, nil, nil, true)
 }
 
 func (r *eventRouter) nodeUpdate(oldObject, newObject any) {
@@ -427,7 +427,7 @@ func (r *eventRouter) nodeUpdate(oldObject, newObject any) {
 		return
 	}
 	groups := append(r.registry.matching(oldNode), r.registry.matching(newNode)...)
-	r.routeNodeWithBindings(newNode, uniqueGroupKeys(groups), bound)
+	r.routeNodeWithBindings(newNode, uniqueGroupKeys(groups), bound, false)
 }
 
 func (r *eventRouter) nodeDelete(object any) {
@@ -456,11 +456,12 @@ func (r *eventRouter) nodeDelete(object any) {
 	}
 }
 
-func (r *eventRouter) routeNode(node *corev1.Node, groups []allocate.GroupKey) {
-	r.routeNodeWithBindings(node, groups, nil)
-}
-
-func (r *eventRouter) routeNodeWithBindings(node *corev1.Node, groups []allocate.GroupKey, bound []*mokkav1alpha1.SGPURack) {
+func (r *eventRouter) routeNodeWithBindings(
+	node *corev1.Node,
+	groups []allocate.GroupKey,
+	bound []*mokkav1alpha1.SGPURack,
+	fresh bool,
+) {
 	if groups == nil {
 		groups = r.registry.matching(node)
 	}
@@ -472,7 +473,16 @@ func (r *eventRouter) routeNodeWithBindings(node *corev1.Node, groups []allocate
 		bound = r.boundRacks(node.Name, node.UID)
 	}
 	for _, rack := range bound {
-		r.routeRackCurrent(rack, false, nil)
+		var freshSlots map[int32]types.UID
+		if fresh {
+			freshSlots = make(map[int32]types.UID)
+			for _, slot := range rack.Spec.Nodes {
+				if slot.NodeRef != nil && slot.NodeRef.Name == node.Name && slot.NodeRef.UID == node.UID {
+					freshSlots[slot.Index] = slot.NodeRef.UID
+				}
+			}
+		}
+		r.routeRackCurrent(rack, false, freshSlots)
 	}
 }
 
