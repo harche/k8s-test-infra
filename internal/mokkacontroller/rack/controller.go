@@ -162,13 +162,18 @@ type WorkStats struct {
 	RacksReconciled    int64
 }
 
+type profileRevisionPrecomputer func(
+	*mokkav1alpha1.SGPURackProfile,
+) (materialize.PrecomputedProfileRevision, error)
+
 // Reconciler materializes one cached inventory key at a time.
 type Reconciler struct {
-	cache       Cache
-	inventories InventoryMutations
-	racks       Mutations
-	cleanup     CleanupGate
-	allocation  *AllocationCache
+	cache                     Cache
+	inventories               InventoryMutations
+	racks                     Mutations
+	cleanup                   CleanupGate
+	allocation                *AllocationCache
+	precomputeProfileRevision profileRevisionPrecomputer
 	// refreshAllocation preserves the standalone reconciler contract for
 	// callers that do not wire informer invalidations.
 	refreshAllocation bool
@@ -439,13 +444,13 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 				return err
 			}
 			result.Work.RacksReconciled++
-			rendered, err := materialize.RenderRack(materialize.RackInput{
+			rendered, err := materialize.RenderRackWithRevision(materialize.RackInput{
 				InventoryName: inventory.Name,
 				InventoryUID:  inventory.UID,
 				Group:         group.group,
 				RackIndex:     rackIndex,
 				Profile:       group.profile,
-			})
+			}, group.revision)
 			if err != nil {
 				return fmt.Errorf("render rack group %q index %d: %w", group.group.ID, rackIndex, err)
 			}
@@ -544,34 +549,77 @@ func (r *Reconciler) reconcile(ctx context.Context, key string, requestedGroup *
 }
 
 type resolvedGroup struct {
-	group   mokkav1alpha1.RackGroup
-	profile *mokkav1alpha1.SGPURackProfile
-	key     allocate.GroupKey
+	group    mokkav1alpha1.RackGroup
+	profile  *mokkav1alpha1.SGPURackProfile
+	revision materialize.PrecomputedProfileRevision
+	key      allocate.GroupKey
 }
 
 func (r *Reconciler) resolveGroups(inventory *mokkav1alpha1.SGPUInventory) ([]resolvedGroup, []ProfileIssue, error) {
 	resolved := make([]resolvedGroup, 0, len(inventory.Spec.RackGroups))
 	issues := make([]ProfileIssue, 0)
+	type profileObservation struct {
+		uid        types.UID
+		generation int64
+	}
+	type observedRevision struct {
+		profile  *mokkav1alpha1.SGPURackProfile
+		revision materialize.PrecomputedProfileRevision
+	}
+	profiles := make(map[string]*mokkav1alpha1.SGPURackProfile)
+	revisions := make(map[profileObservation]observedRevision)
 	for _, group := range inventory.Spec.RackGroups {
-		profile, err := r.cache.Profile(group.ProfileRef.Name)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				issues = append(issues, ProfileIssue{RackGroup: group.ID, ProfileName: group.ProfileRef.Name, Reason: "NotFound"})
-				continue
+		profile := profiles[group.ProfileRef.Name]
+		if profile == nil {
+			var err error
+			profile, err = r.cache.Profile(group.ProfileRef.Name)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					issues = append(issues, ProfileIssue{RackGroup: group.ID, ProfileName: group.ProfileRef.Name, Reason: "NotFound"})
+					continue
+				}
+				return nil, nil, fmt.Errorf("get profile %q from cache: %w", group.ProfileRef.Name, err)
 			}
-			return nil, nil, fmt.Errorf("get profile %q from cache: %w", group.ProfileRef.Name, err)
+			profiles[group.ProfileRef.Name] = profile
 		}
 		if err := materialize.ValidateProfile(profile.Spec); err != nil {
 			issues = append(issues, ProfileIssue{RackGroup: group.ID, ProfileName: group.ProfileRef.Name, Reason: err.Error()})
 			continue
 		}
+		observation := profileObservation{uid: profile.UID, generation: profile.Generation}
+		observed, found := revisions[observation]
+		if found && observed.profile != profile {
+			return nil, nil, fmt.Errorf(
+				"profile UID %q generation %d has inconsistent cache observations",
+				profile.UID,
+				profile.Generation,
+			)
+		}
+		if !found {
+			revision, err := r.profileRevision(profile)
+			if err != nil {
+				return nil, nil, fmt.Errorf("compute revision for profile %q: %w", profile.Name, err)
+			}
+			observed = observedRevision{profile: profile, revision: revision}
+			revisions[observation] = observed
+		}
 		resolved = append(resolved, resolvedGroup{
-			group:   group,
-			profile: profile,
-			key:     allocate.GroupKey{InventoryName: inventory.Name, InventoryUID: inventory.UID, RackGroup: group.ID},
+			group:    group,
+			profile:  profile,
+			revision: observed.revision,
+			key:      allocate.GroupKey{InventoryName: inventory.Name, InventoryUID: inventory.UID, RackGroup: group.ID},
 		})
 	}
 	return resolved, issues, nil
+}
+
+func (r *Reconciler) profileRevision(
+	profile *mokkav1alpha1.SGPURackProfile,
+) (materialize.PrecomputedProfileRevision, error) {
+	if r.precomputeProfileRevision != nil {
+		return r.precomputeProfileRevision(profile)
+	}
+	return materialize.PrecomputeProfileRevision(profile)
 }
 
 func validateResolvedCapacity(groups []resolvedGroup) error {
@@ -607,13 +655,13 @@ func validateGroupMaterialization(
 	valid := make([]resolvedGroup, 0, len(groups))
 	issues := make([]ProfileIssue, 0)
 	for _, group := range groups {
-		_, err := materialize.RenderRack(materialize.RackInput{
+		_, err := materialize.RenderRackWithRevision(materialize.RackInput{
 			InventoryName: inventory.Name,
 			InventoryUID:  inventory.UID,
 			Group:         group.group,
 			RackIndex:     0,
 			Profile:       group.profile,
-		})
+		}, group.revision)
 		if err != nil {
 			issues = append(issues, ProfileIssue{
 				RackGroup: group.group.ID, ProfileName: group.profile.Name, Reason: err.Error(),

@@ -200,6 +200,32 @@ func TestRenderRack(t *testing.T) {
 	require.Equal(t, profileAddress, profile.Spec.Node.Topology.GPUSlots[0].PCIAddress)
 }
 
+func TestRenderRackWithPrecomputedRevisionBindsProfileObservation(t *testing.T) {
+	profile := validProfile()
+	input := RackInput{
+		InventoryName: "inventory-a",
+		InventoryUID:  types.UID("inventory-uid-a"),
+		Group:         mokkav1alpha1.RackGroup{ID: "compute", Count: 1},
+		Profile:       profile,
+	}
+	expectedRevision, err := ProfileRevision(profile.Spec)
+	require.NoError(t, err)
+	precomputed, err := PrecomputeProfileRevision(profile)
+	require.NoError(t, err)
+
+	profile.Spec.Software.DriverVersion = "changed-after-resolution"
+	rendered, err := RenderRackWithRevision(input, precomputed)
+	require.NoError(t, err)
+	require.Equal(t, expectedRevision, rendered.Spec.ProfileRef.Revision)
+	changedRevision, err := ProfileRevision(profile.Spec)
+	require.NoError(t, err)
+	require.NotEqual(t, changedRevision, rendered.Spec.ProfileRef.Revision)
+
+	input.Profile = profile.DeepCopy()
+	_, err = RenderRackWithRevision(input, precomputed)
+	require.EqualError(t, err, "precomputed revision belongs to a different profile observation")
+}
+
 func TestRenderRackRejectsInvalidCoordinates(t *testing.T) {
 	profile := validProfile()
 	base := RackInput{

@@ -128,13 +128,13 @@ func projectionTargetMatches(
 	inventory *mokkav1alpha1.SGPUInventory,
 	group resolvedGroup,
 ) (bool, error) {
-	rendered, err := materialize.RenderRack(materialize.RackInput{
+	rendered, err := materialize.RenderRackWithRevision(materialize.RackInput{
 		InventoryName: inventory.Name,
 		InventoryUID:  inventory.UID,
 		Group:         group.group,
 		RackIndex:     rack.Spec.Identity.RackIndex,
 		Profile:       group.profile,
-	})
+	}, group.revision)
 	if err != nil {
 		return false, nil
 	}

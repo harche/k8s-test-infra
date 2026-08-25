@@ -126,6 +126,66 @@ func TestReconcileCreatesCacheMissingRacksWithOneWriteEach(t *testing.T) {
 	require.Equal(t, map[string]int{"create": rackCount}, actionCounts)
 }
 
+func TestReconcileComputesRevisionOncePerProfileObservation(t *testing.T) {
+	ctx := context.Background()
+	shared := testProfile("shared", "shared-profile-uid", 7, 1, 1)
+	other := testProfile("other", "other-profile-uid", 3, 1, 1)
+	other.Spec.Software.DriverVersion = "other-driver"
+	inventory := testInventory("inventory", "inventory-uid", shared.Name, 2)
+	inventory.Finalizers = []string{InventoryFinalizer}
+	second := inventory.Spec.RackGroups[0]
+	second.ID = "second"
+	second.Count = 3
+	third := inventory.Spec.RackGroups[0]
+	third.ID = "third"
+	third.Count = 1
+	third.ProfileRef.Name = other.Name
+	inventory.Spec.RackGroups = append(inventory.Spec.RackGroups, second, third)
+	h := newHarness(t, []runtime.Object{shared, other, inventory}, nil)
+
+	type observation struct {
+		uid        types.UID
+		generation int64
+	}
+	calls := make(map[observation]int)
+	reconciler := NewReconciler(
+		h.cache,
+		h.mokka.MokkaV1alpha1().SGPUInventories(),
+		h.mokka.MokkaV1alpha1().SGPURacks(),
+		CleanupGateFunc(func(CleanupNeeded) bool { return false }),
+	)
+	reconciler.precomputeProfileRevision = func(
+		profile *mokkav1alpha1.SGPURackProfile,
+	) (materialize.PrecomputedProfileRevision, error) {
+		calls[observation{uid: profile.UID, generation: profile.Generation}]++
+		return materialize.PrecomputeProfileRevision(profile)
+	}
+
+	result, err := reconciler.Reconcile(ctx, inventory.Name)
+	require.NoError(t, err)
+	require.True(t, result.ResolvedRefs)
+	require.EqualValues(t, 6, result.Work.RacksReconciled)
+	require.Equal(t, map[observation]int{
+		{uid: shared.UID, generation: shared.Generation}: 1,
+		{uid: other.UID, generation: other.Generation}:   1,
+	}, calls)
+
+	sharedRevision, err := materialize.ProfileRevision(shared.Spec)
+	require.NoError(t, err)
+	otherRevision, err := materialize.ProfileRevision(other.Spec)
+	require.NoError(t, err)
+	racks, err := h.mokka.MokkaV1alpha1().SGPURacks().List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, racks.Items, 6)
+	for _, rack := range racks.Items {
+		want := sharedRevision
+		if rack.Spec.Identity.RackGroup == third.ID {
+			want = otherRevision
+		}
+		require.Equal(t, want, rack.Spec.ProfileRef.Revision)
+	}
+}
+
 func TestSupportedInventoryCapacityBoundariesAndOverflow(t *testing.T) {
 	profile := testProfile("p", "profile-uid", 1, 1, 64)
 	group := mokkav1alpha1.RackGroup{ID: "group", Count: 100_000}

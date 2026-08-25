@@ -41,6 +41,14 @@ type RackInput struct {
 	Profile       *mokkav1alpha1.SGPURackProfile
 }
 
+// PrecomputedProfileRevision binds a canonical revision to the immutable
+// profile observation used to compute it.
+type PrecomputedProfileRevision struct {
+	source   *mokkav1alpha1.SGPURackProfile
+	profile  *mokkav1alpha1.SGPURackProfile
+	revision string
+}
+
 // Rack is the pure materialization result consumed by rack reconciliation.
 type Rack struct {
 	Name string
@@ -150,10 +158,43 @@ func ProfileRevision(spec mokkav1alpha1.SGPURackProfileSpec) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// PrecomputeProfileRevision snapshots a profile and computes its canonical
+// revision for reuse across renders of that exact observation.
+func PrecomputeProfileRevision(
+	profile *mokkav1alpha1.SGPURackProfile,
+) (PrecomputedProfileRevision, error) {
+	if profile == nil {
+		return PrecomputedProfileRevision{}, errors.New("profile must not be nil")
+	}
+	snapshot := profile.DeepCopy()
+	revision, err := ProfileRevision(snapshot.Spec)
+	if err != nil {
+		return PrecomputedProfileRevision{}, err
+	}
+	return PrecomputedProfileRevision{source: profile, profile: snapshot, revision: revision}, nil
+}
+
 // RenderRack materializes every logical Node and GPU identity.
-//
-//nolint:cyclop // Rendering validates each identity and topology input before materialization.
 func RenderRack(input RackInput) (Rack, error) {
+	return renderRack(input, "")
+}
+
+// RenderRackWithRevision renders with a revision precomputed from the same
+// profile observation. The bound snapshot keeps the revision and rendered
+// profile content consistent even if a caller later mutates its source object.
+func RenderRackWithRevision(input RackInput, precomputed PrecomputedProfileRevision) (Rack, error) {
+	if precomputed.source == nil || precomputed.profile == nil || precomputed.revision == "" {
+		return Rack{}, errors.New("precomputed profile revision must not be empty")
+	}
+	if input.Profile != precomputed.source {
+		return Rack{}, errors.New("precomputed revision belongs to a different profile observation")
+	}
+	input.Profile = precomputed.profile
+	return renderRack(input, precomputed.revision)
+}
+
+//nolint:cyclop // Rendering validates each identity and topology input before materialization.
+func renderRack(input RackInput, revision string) (Rack, error) {
 	if input.InventoryName == "" {
 		return Rack{}, errors.New("inventory name must not be empty")
 	}
@@ -180,9 +221,12 @@ func RenderRack(input RackInput) (Rack, error) {
 		return Rack{}, fmt.Errorf("validate profile: %w", err)
 	}
 
-	revision, err := ProfileRevision(input.Profile.Spec)
-	if err != nil {
-		return Rack{}, err
+	if revision == "" {
+		var err error
+		revision, err = ProfileRevision(input.Profile.Spec)
+		if err != nil {
+			return Rack{}, err
+		}
 	}
 	spec := mokkav1alpha1.SGPURackSpec{
 		InventoryRef: mokkav1alpha1.SGPURackInventoryReference{
